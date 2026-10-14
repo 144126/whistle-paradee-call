@@ -3,3 +3,4 @@ env.json
 node_modules/
 dist/
 *.zip
+.wrangler/
