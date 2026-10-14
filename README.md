@@ -1,0 +1,288 @@
+# Whistle + Paradee in the browser
+
+One static page, `index.html`. Speech in, text out, and text back to speech.
+Speech-to-text and text-to-speech run entirely in the browser: no server, no API, no tunnel (the optional
+**Call** adds a language-model API for the replies). The only network
+use is downloading the model files from Hugging Face, which the browser then caches.
+
+## Replicate from scratch
+
+You need Node 20 or newer, a Chromium-based browser (Chrome, Edge; Firefox and Safari are untested),
+and, for **Call** only, a Baseten and/or Groq API key. Dictation and Read aloud need no key at all.
+
+```bash
+git clone <this repo> whistle && cd whistle
+export BASETEN_API_KEY=...        # optional, for "Call Baseten"
+export GROQ_API_KEY=...           # optional, for "Call Groq"
+node server.mjs                   # http://localhost:8123 (no npm install: it has no dependencies)
+```
+
+Open `http://localhost:8123` (not `file://`: workers are blocked there). Wait for the buttons to leave
+"Loading…" (about 10 s on the first visit while about 26 MB of models download and are cached by the
+browser). Allow the microphone for that site; if the status line says `NotAllowedError`, allow it and reload.
+
+`server.mjs` serves `index.html` and `lib/` only, bound to 127.0.0.1, and forwards the model calls for
+**Call** to Baseten or Groq with the keys from its environment. A key never reaches the browser or any file.
+Any other static server also works for dictation and Read aloud (it must send the two isolation headers in
+`_headers` to get multi-threaded speech); Call then asks for a pasted Baseten key and calls Baseten directly.
+
+### Where everything comes from
+
+The repo is complete except the two models, which the page downloads from Hugging Face at pinned commits
+(see "Pinned models" below). `lib/` is vendored from npm and can be rebuilt byte for byte:
+
+```bash
+mkdir v && cd v && pnpm init && pnpm add onnxruntime-web@1.22.0 phonemizer@1.2.1
+cp node_modules/onnxruntime-web/dist/{ort.wasm.min.mjs,ort-wasm-simd-threaded.mjs,ort-wasm-simd-threaded.wasm} ../lib/
+cp node_modules/phonemizer/dist/phonemizer.js ../lib/
+cp node_modules/phonemizer/LICENSE ../lib/phonemizer.LICENSE
+cd .. && rm -r v
+```
+
+To change the pinned Whistle or Paradee files, edit the URLs near the top of `index.html`.
+
+## What it does
+
+- **Start / Stop**: streaming dictation. Each pause (270 ms of silence) sends the
+  segment to Whistle, and the text is appended to the box.
+- **Read aloud**: speaks the text box with Paradee, one sentence at a time.
+  Press again to stop; stopping cancels generation.
+
+- **Call**: a spoken conversation. Whistle transcribes as you talk, and after 1440 ms of
+  silence the turn goes to a language model on Baseten. Its reply streams back and is spoken
+  sentence by sentence as it arrives. Start/Stop dictation and Read aloud are unchanged.
+
+## The call
+
+Press Call. With `server.mjs` running there is nothing to paste: the page asks `/api/config`
+whether the server holds a key, hides the key field if so, and posts the conversation to
+`/api/chat`, which adds the key and streams Baseten's reply back. Text goes to the model; audio
+never leaves the device.
+
+`server.mjs` only accepts requests whose `Host` and `Origin` are this page, so other sites and
+DNS-rebinding tricks can't spend the key. It forwards only `model`, `messages`, `stream`,
+`max_tokens`, `temperature`, `reasoning_effort`, caps the body at 64 KB, and uses `pipeline` so a
+client that hangs up mid-stream (an interrupt) doesn't crash it.
+
+Without a server key (a plain static host), open "Call settings" and paste one; it is kept in
+that browser only and sent straight to `inference.baseten.co`, which allows browser (CORS) calls.
+
+## Deploying
+
+Both options give the page a server-side key, so nothing secret is in the code. **A deployed URL is public:
+anyone who opens it can run Call on your keys.** Keep the URL private, cap spend (Baseten/Groq dashboards, AWS
+Budgets), and see the AWS notes below.
+
+### Cloudflare Pages
+
+`functions/api/chat.js` and `functions/api/config.js` are the same two routes. Set the keys as secrets, not in
+code: `wrangler pages secret put BASETEN_API_KEY` (and `GROQ_API_KEY`). Deploy `index.html`, `_headers`, `lib/`
+and `functions/`; leave out `server.mjs`, `lambda/` and this README. Written but not run on Cloudflare yet.
+
+### AWS Lambda
+
+`lambda/handler.mjs` does everything `server.mjs` does (serves the page and `lib/`, `/api/config`, `/api/chat`
+streaming to Baseten or Groq, the same origin check, field whitelist and isolation headers) behind a
+**Function URL with response streaming**, so the reply streams and the page is same-origin with its API.
+It has no dependencies. Tested here by running the handler under a stand-in for Lambda's streaming runtime
+(page and wasm served byte for byte, both providers streamed, bad origin/path/provider rejected). **It has
+not been deployed to a real AWS account**, so expect to adjust the IAM/URL steps below to what the console says.
+Needs the AWS CLI configured, and `zip`.
+
+```bash
+# 1. package: the handler must sit next to index.html and lib/
+mkdir -p dist && cp lambda/handler.mjs index.html dist/ && cp -r lib dist/
+(cd dist && zip -qr ../whistle.zip .)
+
+# 2. role (once)
+aws iam create-role --role-name whistle-lambda --assume-role-policy-document \
+  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name whistle-lambda \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# 3. keys in an uncommitted file (it is in .gitignore), not on the command line
+echo '{"Variables":{"BASETEN_API_KEY":"...","GROQ_API_KEY":"..."}}' > env.json
+
+# 4. function (wait ~10 s after step 2 for the role to propagate)
+aws lambda create-function --function-name whistle --runtime nodejs22.x --handler handler.handler \
+  --role arn:aws:iam::<ACCOUNT_ID>:role/whistle-lambda --zip-file fileb://whistle.zip \
+  --timeout 60 --memory-size 256 --environment file://env.json
+
+# 5. public URL with streaming (RESPONSE_STREAM is required for the reply to stream)
+aws lambda create-function-url-config --function-name whistle --auth-type NONE --invoke-mode RESPONSE_STREAM
+aws lambda add-permission --function-name whistle --statement-id url-public \
+  --action lambda:InvokeFunctionUrl --principal '*' --function-url-auth-type NONE
+aws lambda add-permission --function-name whistle --statement-id url-public-invoke \
+  --action lambda:InvokeFunction --principal '*' --invoked-via-function-url
+```
+
+Step 5 prints a `https://<id>.lambda-url.<region>.on.aws` address: open it. Update later with
+`aws lambda update-function-code --function-name whistle --zip-file fileb://whistle.zip`.
+
+- **Cost and limits:** the free tier is 1,000,000 requests and 400,000 GB-seconds a month. The page's files
+  and each model call are one short invocation, so a call uses a few invocations per turn. A new account can
+  start with a low concurrency quota (one report saw 10); raise it in Service Quotas before sharing the URL.
+  Lambda caps an invocation at 15 minutes, which does not matter here because a call is many short requests.
+- **Spend cap:** `aws lambda put-function-concurrency --function-name whistle --reserved-concurrent-executions 30`
+  limits parallel use, but AWS requires 100 unreserved executions in the account, so it fails on low quotas.
+  For real protection put CloudFront with WAF rate limiting in front, or use `--auth-type AWS_IAM`.
+- **Keys:** Lambda environment variables are encrypted at rest but readable in the console by anyone with
+  access. Use Secrets Manager if that matters (not implemented).
+- **Cold starts:** this function is tiny, so a cold start costs well under a second. The expensive
+  cold start would be loading speech models on Lambda, which this setup avoids.
+
+### Should speech-to-text and the voice move to Lambda too?
+
+Not recommended, and not implemented. Today Whistle and Paradee run in each visitor's browser, so 27 or 2,700
+users cost nothing and need no server capacity; the only shared limit is the model provider (Groq's free tier
+failed at 10 callers, see the stress table). On Lambda each warm invocation would have to hold a 9 MB voice
+model, the 17 MB Whistle model and a runtime (a cold start of several seconds, unmeasured), audio would travel
+both ways, and Lambda cannot hold a WebSocket without API Gateway in front. Native onnxruntime might make each
+step 2-3x faster than the browser's wasm, but a network round trip of roughly 0.2-0.3 s would eat most of
+that: a guess of 0.3-0.6 s gained per turn on warm environments, none measured. The case for it is weak
+phones: Paradee makes audio about 3-5x faster than real time on this laptop; a phone 3-4x slower would be near
+real time (first sentence in 3-4 s, possible gaps), which is untested. A middle option is to keep Whistle in the
+browser and put only Paradee on a server.
+
+- **Turn end:** `TURN_MS = 1440` of silence, and every transcription has returned. Segments are
+  still cut at 270 ms, so by then the text is already ready.
+- **Model:** `openai/gpt-oss-120b` (low reasoning effort) by default. Baseten's Model API has no small
+  model, only twelve large ones; gpt-oss-120b activates about 5B parameters, so it is also the fastest.
+  Median of 3 runs on a real conversation prompt, time to the first speakable chunk (a clause or
+  sentence): gpt-oss-120b 689 ms, GLM-5.3-Flash 849, Nemotron-3-Ultra 880, GLM-5.3-Fast 1040,
+  DeepSeek-V4.1-Flash-Fast 1091, DeepSeek-V4.1-Flash 1627, the rest 1.8 s or more (DeepSeek-V4-Pro 23 s).
+  All are reasoning models; only `delta.content` is spoken.
+- **Two call buttons:** "Call Baseten" (model from the settings field, default `openai/gpt-oss-120b`) and
+  "Call Groq" (always `openai/gpt-oss-120b` on Groq, server only). The Groq route reads the key from
+  `GROQ_API_KEY` (or `GROQ`). Smallest Groq model that
+  can call functions is `gpt-oss-20b`; `allam-2-7b` (7B) answers HTTP 400 "tool calling is not supported", and
+  `gpt-oss-safeguard-20b` works but is capped at 2000 tokens/min. `gpt-oss-20b` was not faster than Baseten 120B in this app
+  (median first audio about 2.0 s against 1.2-1.7 s).
+- **Groq rate limits, stress-tested** (this key, `gpt-oss-20b`: 8000 tokens/min, 1000 requests/day). Simulated
+  callers take a turn every ~12 s with history and a tool definition (about 350 tokens per request, 6 requests a
+  minute each), 60 s per stage, no retries:
+
+  | callers | requests | rejected (429) | first token p50 / p95 |
+  |---|---|---|---|
+  | 1 | 7 | 0 | 907 / 1437 ms |
+  | 3 | 21 | 0 | 815 / 1137 ms |
+  | 5 | 34 | 0 (bucket down to 2221 of 8000) | 609 / 1261 ms |
+  | 10 | 62 | 21 (34%) | 453 / 949 ms |
+  | 20 | 118 | 69 (58%) | 497 / 1299 ms |
+
+  Tokens per minute is the limit that binds: about 2.2k tokens per caller-minute means roughly 3-4 sustained
+  callers (5 only passed because the first minute starts with a full bucket). A 429 carries `Retry-After: 2`.
+  The daily limit is next: one caller at 5 turns a minute uses 1000 requests in about 3 hours. 20 callers need
+  roughly 6x the tokens-per-minute limit, so a higher Groq tier, or Baseten, is needed.
+- **Streaming speech:** the reply is split at sentence ends. The first chunk may break at a comma or
+  dash after 20 characters, so audio starts sooner. Queued sentences go to Paradee in one call.
+- **Continuing a turn:** if you speak again before the reply's audio starts, the pending reply is
+  dropped and your new words are merged into the same turn.
+- **Half duplex by default:** the mic is ignored while the reply plays, and for 400 ms after.
+  With "Let me interrupt" ticked, 8 net loud frames (clearly above the noise floor) cut the reply
+  off, and what you said starts the next turn. It relies on the browser's echo cancellation, so
+  use headphones if the reply leaks into the mic.
+- **Measured (real Baseten, fake mic):** the turn fires 1.44 s after speech ends. First audio came
+  1.2, 2.0, 2.3 and 2.3 s after that (the page shows it in the status line). The model's first token
+  takes 0.9-1.1 s through the proxy. Whistle itself takes about 0.3 s per short segment, and
+  forcing the language to English makes no difference.
+- **Limits:** history keeps the whole reply even if you interrupted partway. Free OpenRouter has no
+  Ling Flash model (only paid), which is why Baseten is used.
+
+## Audio quality: what was checked
+
+The voice was reported as buzzy/static, then "static again" in calls. Verified clean, so don't redo these:
+the model output matches the authors' misaki reference on noise metrics (energy above 4 kHz, spectral flatness,
+pause floor); threaded and single-threaded synthesis are statistically identical over 12 runs each; clause
+chunks start and end at silence; the audio clock doesn't stall under synthesis load; and what Chrome delivers to
+the sound server matches the samples the page sent (gain 1.0, 34-42 dB SNR) with echo cancellation on or off.
+Found and fixed: playing 24 kHz buffers on a 48 kHz context (Chrome's linear resampler added imaging, 0.35% of
+energy above 12 kHz). Not yet explained: static heard only in calls. The analog output stages are all at 100%
+and the voice is quiet (RMS about -26 dBFS), so output is boosted 2x (`VOICE_GAIN`, capped at 0.95 peak) to
+allow a lower system volume. Playwright launches Chromium with `--mute-audio`, so headless tests never reach a
+sound device unless `ignoreDefaultArgs: ["--mute-audio"]`.
+
+## Pinned models (do not use `main` URLs)
+
+| What | Source |
+|---|---|
+| Whistle engine | `huggingface.co/Cactus-Compute/needle3/resolve/c7c415a3d1b3d929014bc6e866d51ebb971f7089/wasm/` (`needle.js`, `needle.wasm`) |
+| Whistle model | `huggingface.co/Cactus-Compute/whistle/resolve/b358ddadd89b7a713b5aa131f23032d3cca1b251/whistle.cact` (16.9 MB) |
+| Paradee TTS | `huggingface.co/sahilmahendrakar/Paradee-8M-v1.0/resolve/c7f83f86c04e84d0ae94cbe1aad7618e0544f80a/` (`onnx/paradee_int8.onnx` 9 MB, `config.json`) |
+
+Both downloads go through the Cache API (`whistle-v1`, `paradee-v1`).
+
+Vendored in `lib/` (no CDN at runtime):
+
+- `ort.wasm.min.mjs`, `ort-wasm-simd-threaded.mjs`, `ort-wasm-simd-threaded.wasm`: onnxruntime-web 1.22.0
+- `phonemizer.js`: phonemizer 1.2.1 (espeak-ng compiled to WASM), license in `phonemizer.LICENSE`
+
+Paradee is a distilled Kokoro-82M model. It is not Parakeet, which is NVIDIA's speech-to-text model.
+
+## Speech in: how it segments
+
+Audio is 16 kHz mono, read in 20 ms frames by an AudioWorklet.
+
+- `SILENCE_MS = 270`: a segment ends after this much silence.
+- Start: 2 loud frames. Loud means RMS above `max(0.01, 4 × noise floor)`.
+  The floor adapts while the room is quiet.
+- Pre-roll: 10 frames (200 ms) before the start are kept.
+- Tail: at most 10 frames (200 ms) of trailing silence are sent.
+- Drop speech shorter than 200 ms. Force a cut at 25 s (the engine's limit is 30 s).
+
+## Speech out: how it works
+
+Clauses are split on `.!?…,;:` and phonemized in one espeak call per passage.
+Each phonemize call costs about 650 ms in the browser, mostly fixed, so one call
+is much faster than one per sentence.
+
+Each espeak phoneme is mapped to misaki's symbols with `MAP` (the untied form of
+misaki's `espeak.py` E2M table). Paradee was trained on misaki phonemes.
+Clauses are grouped by sentence so each sentence gets one model call and keeps
+its intonation. Phonemes are capped at 510 per call, as in Paradee's Python code.
+
+The voice runs in its own worker. Each sentence's audio is posted back as soon as
+it is ready and scheduled on an AudioContext created at 24 kHz (`latencyHint: "playback"`).
+
+Two things that matter for sound quality and correctness:
+
+- **Play at 24 kHz.** Paradee outputs 24 kHz. On a 48 kHz context Chrome resamples each
+  buffer with linear interpolation, which measured 0.35% of the energy above 12 kHz (an ideal
+  upsample has about 0.00001%) and halved the 8–12 kHz band. That is audible as buzz and
+  static. At 24 kHz the page hands over exact samples and the OS does the rate conversion.
+- **Ignore the mic while reading.** Otherwise the speaker output is transcribed back into
+  the text box. Reading flushes the open segment and drops mic frames until playback ends.
+
+The model itself is not deterministic: two native runs on identical input differ by up to
+0.06, because Paradee has a random noise source for fricatives. Don't compare outputs sample by
+sample; compare spectra.
+
+## Measured (headless Chromium, 8 CPUs, one WASM thread)
+
+- Model load: about 10 s the first time, instant after caching.
+- 4.4 s sentence: first audio at about 3.8 s, all audio after about 4.8 s.
+- Three-sentence passage (7.7 s of audio): generation finishes in 5.6 s.
+- Stop: cancels generation within one chunk.
+- Round trip: Paradee's speech transcribed by Whistle as "Whistle transcribed speech on
+  your device, and Paradey reads it back. Is it a question? Yes, it is."
+
+Not measured: live microphone input and real-speech accuracy. The test voice was synthetic.
+
+## Known limits and next steps
+
+- Paradee is multi-threaded only when the page is cross-origin isolated. `server.mjs` sends
+  `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`, and
+  `_headers` does the same on Cloudflare Pages. That cut synthesis time about 40% (4.3 s sentence:
+  1316 ms to 780 ms). Without those headers it falls back to one thread. Whistle's engine is single-threaded.
+- Paradee's cost is synthesis, about 0.2-0.3 s per second of audio. Phonemizing is 90-130 ms once warm.
+  fp32 is no faster than int8.
+- The 270 ms pause is a guess. Real speech may need 300–500 ms to avoid splitting mid-sentence.
+- Phonemes come from espeak, not misaki's dictionary, so a few words differ
+  (for example "device" comes out "dɪvˈIs" against misaki's "dəvˈIs").
+- Language is detected per segment.
+- Paradee speaks one voice (Kokoro's `af_heart`) and English only.
+- Cached files and isolation: onnxruntime's thread-worker script must carry the isolation headers, and a copy cached
+  before they were added is refused, which made the voice hang on "Loading voice…" with no error. The server now
+  sends `Cache-Control: no-cache` with an ETag (304 on revalidation), the library folder was renamed `lib/` to drop
+  stale entries, and the page retries the voice on one thread after 45 s (`VOICE_TIMEOUT_MS`) or says what to do.
+- `file://` is blocked: the page shows a message asking for http.
