@@ -75,9 +75,26 @@ Budgets), and see the AWS notes below.
 
 ### Cloudflare Pages
 
-`functions/api/chat.js` and `functions/api/config.js` are the same two routes. Set the keys as secrets, not in
-code: `wrangler pages secret put BASETEN_API_KEY` (and `GROQ_API_KEY`). Deploy `index.html`, `_headers`, `lib/`
-and `functions/`; leave out `server.mjs`, `lambda/` and this README. Written but not run on Cloudflare yet.
+Live at https://whistle-81u.pages.dev (project `whistle`). `functions/api/chat.js` and `functions/api/config.js`
+are the same two routes as `server.mjs`. Keys are Cloudflare secrets, never in code:
+
+```bash
+pnpm dlx wrangler login                                  # or set CLOUDFLARE_API_TOKEN
+pnpm dlx wrangler pages project create whistle --production-branch main
+printf %s "$BASETEN_API_KEY" | pnpm dlx wrangler pages secret put BASETEN_API_KEY --project-name whistle
+printf %s "$GROQ_API_KEY"    | pnpm dlx wrangler pages secret put GROQ_API_KEY --project-name whistle
+
+rm -rf dist && mkdir dist && cp index.html _headers dist/ && cp -r lib dist/
+pnpm dlx wrangler pages deploy dist --project-name whistle --branch main
+```
+
+`dist/` holds only the page, `_headers` (the isolation headers) and `lib/`. The functions are picked up from
+`functions/` next to it, so `server.mjs`, `lambda/` and this README are not uploaded. Redeploy with the last
+command after any change.
+
+Checked on the live URL: the page loads with the isolation headers, `/api/config` reports both providers,
+`/api/chat` streams from Baseten and Groq, a foreign Origin gets 403, and in headless Chromium with a fake
+mic both call buttons complete a turn, dictation writes text, and Read aloud plays and stops.
 
 ### AWS Lambda
 
