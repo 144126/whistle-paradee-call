@@ -20,6 +20,7 @@
 <button id="read" disabled>Loading voice…</button>
 <button id="call" aria-pressed="false" disabled>Call Baseten</button>
 <button id="call_groq" aria-pressed="false" disabled>Call Groq</button>
+<button id="mute" aria-pressed="false" disabled>Mute</button>
 <span id="meta"></span>
 <details id="settings">
   <summary>Call settings</summary>
@@ -634,7 +635,18 @@ function setCallUi(on) {
   }
   $("mic").disabled = on;
   $("read").disabled = on;
+  $("mute").disabled = !on;
+  $("mute").textContent = "Mute";
+  $("mute").setAttribute("aria-pressed", "false");
 }
+
+// a disabled mic track sends silence, so the segmenter just sees no speech
+$("mute").onclick = () => {
+  const t = live.stream.getAudioTracks()[0];
+  t.enabled = !t.enabled;
+  $("mute").textContent = t.enabled ? "Mute" : "Unmute";
+  $("mute").setAttribute("aria-pressed", t.enabled ? "false" : "true");
+};
 
 function hangup() {
   call.abort?.abort();

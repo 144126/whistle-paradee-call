@@ -50,7 +50,8 @@ To change the pinned Whistle or Paradee files, edit the URLs near the top of `in
 
 - **Call**: a spoken conversation. Whistle transcribes as you talk, and after 1440 ms of
   silence the turn goes to a language model on Baseten. Its reply streams back and is spoken
-  sentence by sentence as it arrives. Start/Stop dictation and Read aloud are unchanged.
+  sentence by sentence as it arrives. Mute (during a call) silences your mic without hanging up.
+Start/Stop dictation and Read aloud are unchanged.
 
 ## The call
 
