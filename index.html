@@ -13,6 +13,8 @@
   details p { margin: .5rem 0; }
   input[type=password], input[type=text] { font: inherit; padding: .3rem; width: 24rem; max-width: 100%; }
   select { font: inherit; padding: .45rem; border-radius: .6rem; border: 1px solid; background: #fff; }
+  #groq_model { max-width: 100%; min-height: 44px; color: #222; }
+  #groq_model:focus-visible { outline: 2px solid #222; outline-offset: 2px; }
   #voicerow { display: inline-block; margin-left: .8rem; font-size: 15px; color: #444; }
   #meta { color: #888; font-size: 14px; margin-left: .8rem; }
   #chat p { margin: .4rem 0; }
@@ -26,6 +28,23 @@
 <button id="mute" aria-pressed="false" disabled>Mute</button>
 <label id="voicerow">Voice <select id="engine"></select></label>
 <span id="meta"></span>
+<p><label for="groq_model">groq model</label><br>
+<select id="groq_model">
+  <optgroup label="production">
+    <option value="openai/gpt-oss-120b">gpt-oss 120b</option>
+    <option value="openai/gpt-oss-20b">gpt-oss 20b</option>
+  </optgroup>
+  <optgroup label="preview">
+    <option value="qwen/qwen3.8-27b">qwen 3.8 27b</option>
+    <option value="allam-2-7b">allam 2 7b</option>
+  </optgroup>
+  <optgroup label="enterprise access required">
+    <option value="llama-3.1-8b-instant">llama 3.1 8b instant</option>
+    <option value="llama-3.3-70b-versatile">llama 3.3 70b versatile</option>
+    <option value="meta-models/muse-spark-open">muse spark open · preview</option>
+    <option value="minimaxai/minimax-m2.7">minimax m2.7 · preview</option>
+  </optgroup>
+</select></p>
 <details id="settings">
   <summary>Call settings</summary>
   <p id="keyrow"><label>Baseten API key <input id="key" type="password" autocomplete="off"></label></p>
@@ -285,6 +304,9 @@ $("key").value = store.get("key", "");
 $("key").onchange = () => store.set("key", $("key").value.trim());
 $("model").value = store.get("model", "openai/gpt-oss-120b");
 $("model").onchange = () => store.set("model", $("model").value.trim());
+$("groq_model").value = store.get("groq_model", "openai/gpt-oss-120b");
+if (!$("groq_model").value) $("groq_model").value = "openai/gpt-oss-120b";
+$("groq_model").onchange = () => store.set("groq_model", $("groq_model").value);
 $("barge").checked = store.get("barge", "") === "1";
 $("barge").onchange = () => store.set("barge", $("barge").checked ? "1" : "");
 
@@ -840,6 +862,7 @@ async function complete(messages, signal, onDelta) {
       ...(viaServer && { provider }),
       model, messages, stream: true, max_tokens: 150, temperature: 0.7,
       ...(model.includes("gpt-oss") && { reasoning_effort: "low" }),
+      ...(provider === "groq" && model === "qwen/qwen3.8-27b" && { reasoning_effort: "none" }),
     }),
   });
   if (!res.ok) throw new Error(`${PROVIDER_NAME[provider]} ${res.status}: ${(await res.text()).slice(0, 160)}`);
@@ -905,7 +928,7 @@ async function fire() {
 }
 
 const CALLS = { baseten: ["call", "Call Baseten"], groq: ["call_groq", "Call Groq"], openrouter: ["call_mercury", "Call Mercury 3"] };
-const FIXED_MODEL = { groq: "openai/gpt-oss-120b", openrouter: "inception/mercury-3" }; // the others use the model box
+const FIXED_MODEL = { openrouter: "inception/mercury-3" };
 
 function setCallUi(on) {
   for (const [name, [id, label]] of Object.entries(CALLS)) {
@@ -916,6 +939,7 @@ function setCallUi(on) {
   }
   $("mic").disabled = on;
   $("engine").disabled = on; // switching voice mid-call would cut the reply being spoken
+  $("groq_model").disabled = on;
   $("mute").disabled = !on;
   $("mute").textContent = "Mute";
   $("mute").setAttribute("aria-pressed", "false");
@@ -950,7 +974,7 @@ async function start_call(provider) {
   }
   $(CALLS[provider][0]).disabled = true;
   audioOut().resume();
-  call = { provider, model: FIXED_MODEL[provider] ?? $("model").value.trim(), state: "listening", pending: "", turn: "", reply: "", committed: false, history: [], abort: null, userLine: null, aiLine: null };
+  call = { provider, model: provider === "groq" ? $("groq_model").value : FIXED_MODEL[provider] ?? $("model").value.trim(), state: "listening", pending: "", turn: "", reply: "", committed: false, history: [], abort: null, userLine: null, aiLine: null };
   try {
     await listen(callFrame);
   } catch (e) {

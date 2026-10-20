@@ -61,6 +61,8 @@ Start/Stop dictation and Read aloud are unchanged.
 
 ## The call
 
+The **groq model** dropdown selects the model for **Call Groq** and remembers it in this browser. It lists eight conversational models from Groq's current catalog and live Models API, grouped by production, preview, and enterprise access. Enterprise models need an eligible account. GPT-OSS uses low reasoning effort; Qwen uses non-thinking mode for quick spoken replies. Speech and moderation models are not conversation models and stay out of this selector.
+
 Press Call. With `server.mjs` running there is nothing to paste: the page asks `/api/config`
 whether the server holds a key, hides the key field if so, and posts the conversation to
 `/api/chat`, which adds the key and streams Baseten's reply back. Text goes to the model; audio
