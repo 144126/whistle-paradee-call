@@ -7,7 +7,7 @@ use is downloading the model files from Hugging Face, which the browser then cac
 
 ## Replicate from scratch
 
-You need Node 20 or newer, a Chromium-based browser (Chrome, Edge; Firefox and Safari are untested),
+You need Node 20.12 or newer, a Chromium-based browser (Chrome, Edge; Firefox and Safari are untested),
 and, for **Call** only, a Baseten, Groq and/or OpenRouter API key. Dictation and Read aloud need no key at all.
 
 ```bash
@@ -23,7 +23,7 @@ Open `http://localhost:8123` (not `file://`: workers are blocked there). Wait fo
 browser). Allow the microphone for that site; if the status line says `NotAllowedError`, allow it and reload.
 
 `server.mjs` serves `index.html` and `lib/` only, bound to 127.0.0.1, and forwards the model calls for
-**Call** to Baseten, Groq or OpenRouter with the keys from its environment. A key never reaches the browser or any file.
+**Call** to Baseten, Groq or OpenRouter with the keys from its environment or from a gitignored `.env` file next to it (`KEY=value` lines). A key never reaches the browser.
 Any other static server also works for dictation and Read aloud (it must send the two isolation headers in
 `_headers` to get multi-threaded speech); Call then asks for a pasted Baseten key and calls Baseten directly.
 

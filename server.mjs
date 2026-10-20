@@ -9,6 +9,8 @@ import { Readable, pipeline } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+// keys from ./.env (gitignored) when the shell does not set them
+try { process.loadEnvFile(path.join(ROOT, ".env")); } catch {}
 const PORT = Number(process.env.PORT) || 8123;
 const PROVIDERS = {
   baseten: { url: "https://inference.baseten.co/v1/chat/completions", key: process.env.BASETEN_API_KEY },
