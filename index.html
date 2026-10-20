@@ -20,6 +20,7 @@
 <button id="read" disabled>Loading voice…</button>
 <button id="call" aria-pressed="false" disabled>Call Baseten</button>
 <button id="call_groq" aria-pressed="false" disabled>Call Groq</button>
+<button id="call_mercury" aria-pressed="false" disabled>Call Mercury 3</button>
 <button id="mute" aria-pressed="false" disabled>Mute</button>
 <span id="meta"></span>
 <details id="settings">
@@ -247,7 +248,7 @@ const store = {
 const rms = (f) => { let s = 0; for (let i = 0; i < f.length; i++) s += f[i] * f[i]; return Math.sqrt(s / f.length); };
 
 if (location.protocol === "file:") {
-  for (const id of ["mic", "read", "call", "call_groq"]) $(id).textContent = "Serve over http";
+  for (const id of ["mic", "read", "call", "call_groq", "call_mercury"]) $(id).textContent = "Serve over http";
   $("meta").textContent = "Opened from disk. Run: node server.mjs, then open http://localhost:8123";
   throw new Error("file: origin cannot start the workers");
 }
@@ -261,10 +262,11 @@ $("barge").onchange = () => store.set("barge", $("barge").checked ? "1" : "");
 
 // When the page is served by server.mjs (or a deployed /api/chat), that server holds the Baseten key
 // and forwards the calls, so the key never reaches the browser. Otherwise the pasted key is used.
-let serverKey = false, serverGroq = false;
+let serverKey = false, serverGroq = false, serverOpenRouter = false;
 fetch("/api/config").then((r) => (r.ok ? r.json() : {})).then((c) => {
   serverKey = Boolean(c.key);
   serverGroq = Boolean(c.providers?.groq);
+  serverOpenRouter = Boolean(c.providers?.openrouter);
   refresh();
   if (!serverKey) return;
   $("keyrow").hidden = true;
@@ -272,7 +274,7 @@ fetch("/api/config").then((r) => (r.ok ? r.json() : {})).then((c) => {
 }).catch(() => {});
 
 const ready = { whistle: false, voice: false };
-const refresh = () => { if (ready.whistle && ready.voice) { $("call").disabled = false; $("call_groq").disabled = !serverGroq; } };
+const refresh = () => { if (ready.whistle && ready.voice) { $("call").disabled = false; $("call_groq").disabled = !serverGroq; $("call_mercury").disabled = !serverOpenRouter; } };
 
 let call = null;       // the live call, or null
 let pendingAsr = 0;    // segments sent to Whistle and not yet transcribed
@@ -551,18 +553,20 @@ function interrupt() {
 
 // Only delta.content is spoken; reasoning models also stream delta.reasoning, which is ignored.
 async function complete(messages, signal, onDelta) {
-  const groq = call.provider === "groq", model = call.model;
-  const res = await fetch(serverKey ? "/api/chat" : API, {
+  const provider = call.provider, model = call.model;
+  // only Baseten can be called straight from the page with a pasted key; the other providers always go through the server
+  const viaServer = serverKey || provider !== "baseten";
+  const res = await fetch(viaServer ? "/api/chat" : API, {
     method: "POST",
     signal,
-    headers: { "Content-Type": "application/json", ...(!serverKey && { Authorization: "Bearer " + $("key").value.trim() }) },
+    headers: { "Content-Type": "application/json", ...(!viaServer && { Authorization: "Bearer " + $("key").value.trim() }) },
     body: JSON.stringify({
-      ...(serverKey && { provider: groq ? "groq" : "baseten" }),
+      ...(viaServer && { provider }),
       model, messages, stream: true, max_tokens: 150, temperature: 0.7,
       ...(model.includes("gpt-oss") && { reasoning_effort: "low" }),
     }),
   });
-  if (!res.ok) throw new Error(`${groq ? "Groq" : "Baseten"} ${res.status}: ${(await res.text()).slice(0, 160)}`);
+  if (!res.ok) throw new Error(`${PROVIDER_NAME[provider]} ${res.status}: ${(await res.text()).slice(0, 160)}`);
   const reader = res.body.getReader(), dec = new TextDecoder();
   let buf = "";
   for (;;) {
@@ -624,7 +628,9 @@ async function fire() {
   }
 }
 
-const CALLS = { baseten: ["call", "Call Baseten"], groq: ["call_groq", "Call Groq"] };
+const CALLS = { baseten: ["call", "Call Baseten"], groq: ["call_groq", "Call Groq"], openrouter: ["call_mercury", "Call Mercury 3"] };
+const PROVIDER_NAME = { baseten: "Baseten", groq: "Groq", openrouter: "OpenRouter" };
+const FIXED_MODEL = { groq: "openai/gpt-oss-120b", openrouter: "inception/mercury-3" }; // the others use the model box
 
 function setCallUi(on) {
   for (const [name, [id, label]] of Object.entries(CALLS)) {
@@ -655,6 +661,7 @@ function hangup() {
   call = null;
   setCallUi(false);
   $("call_groq").disabled = !serverGroq;
+  $("call_mercury").disabled = !serverOpenRouter;
 }
 
 async function start_call(provider) {
@@ -667,7 +674,7 @@ async function start_call(provider) {
   }
   $(CALLS[provider][0]).disabled = true;
   audioOut().resume();
-  call = { provider, model: provider === "groq" ? "openai/gpt-oss-120b" : $("model").value.trim(), state: "listening", pending: "", turn: "", reply: "", committed: false, history: [], abort: null, userLine: null, aiLine: null };
+  call = { provider, model: FIXED_MODEL[provider] ?? $("model").value.trim(), state: "listening", pending: "", turn: "", reply: "", committed: false, history: [], abort: null, userLine: null, aiLine: null };
   try {
     await listen(callFrame);
   } catch (e) {
@@ -683,4 +690,5 @@ async function start_call(provider) {
 
 $("call").onclick = () => start_call("baseten");
 $("call_groq").onclick = () => start_call("groq");
+$("call_mercury").onclick = () => start_call("openrouter");
 </script>

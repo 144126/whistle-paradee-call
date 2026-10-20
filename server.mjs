@@ -1,6 +1,6 @@
-// Local server for the page: serves index.html and lib/, and forwards /api/chat to Baseten
-// to Baseten or Groq with their keys from the environment (BASETEN_API_KEY, GROQ_API_KEY or GROQ),
-// so a key never reaches the browser or the code.
+// Local server for the page: serves index.html and lib/, and forwards /api/chat to Baseten,
+// Groq or OpenRouter with their keys from the environment (BASETEN_API_KEY, GROQ_API_KEY or GROQ,
+// WHISTLE_OPENROUTER_KEY), so a key never reaches the browser or the code.
 // Run: node server.mjs   (PORT=8123 by default, bound to 127.0.0.1 only)
 import http from "node:http";
 import fs from "node:fs/promises";
@@ -13,6 +13,7 @@ const PORT = Number(process.env.PORT) || 8123;
 const PROVIDERS = {
   baseten: { url: "https://inference.baseten.co/v1/chat/completions", key: process.env.BASETEN_API_KEY },
   groq: { url: "https://api.groq.com/openai/v1/chat/completions", key: process.env.GROQ_API_KEY || process.env.GROQ },
+  openrouter: { url: "https://openrouter.ai/api/v1/chat/completions", key: process.env.WHISTLE_OPENROUTER_KEY },
 };
 const HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`]);
 const ORIGINS = new Set([`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`]);

@@ -8,12 +8,13 @@ use is downloading the model files from Hugging Face, which the browser then cac
 ## Replicate from scratch
 
 You need Node 20 or newer, a Chromium-based browser (Chrome, Edge; Firefox and Safari are untested),
-and, for **Call** only, a Baseten and/or Groq API key. Dictation and Read aloud need no key at all.
+and, for **Call** only, a Baseten, Groq and/or OpenRouter API key. Dictation and Read aloud need no key at all.
 
 ```bash
 git clone <this repo> whistle && cd whistle
 export BASETEN_API_KEY=...        # optional, for "Call Baseten"
 export GROQ_API_KEY=...           # optional, for "Call Groq"
+export WHISTLE_OPENROUTER_KEY=...  # optional, for "Call Mercury 3" (OpenRouter inception/mercury-3)
 node server.mjs                   # http://localhost:8123 (no npm install: it has no dependencies)
 ```
 
@@ -22,7 +23,7 @@ Open `http://localhost:8123` (not `file://`: workers are blocked there). Wait fo
 browser). Allow the microphone for that site; if the status line says `NotAllowedError`, allow it and reload.
 
 `server.mjs` serves `index.html` and `lib/` only, bound to 127.0.0.1, and forwards the model calls for
-**Call** to Baseten or Groq with the keys from its environment. A key never reaches the browser or any file.
+**Call** to Baseten, Groq or OpenRouter with the keys from its environment. A key never reaches the browser or any file.
 Any other static server also works for dictation and Read aloud (it must send the two isolation headers in
 `_headers` to get multi-threaded speech); Call then asks for a pasted Baseten key and calls Baseten directly.
 
@@ -71,7 +72,7 @@ that browser only and sent straight to `inference.baseten.co`, which allows brow
 ## Deploying
 
 Both options give the page a server-side key, so nothing secret is in the code. **A deployed URL is public:
-anyone who opens it can run Call on your keys.** Keep the URL private, cap spend (Baseten/Groq dashboards, AWS
+anyone who opens it can run Call on your keys.** Keep the URL private, cap spend (Baseten/Groq/OpenRouter dashboards, AWS
 Budgets), and see the AWS notes below.
 
 ### Cloudflare Pages
@@ -84,6 +85,7 @@ pnpm dlx wrangler login                                  # or set CLOUDFLARE_API
 pnpm dlx wrangler pages project create whistle --production-branch main
 printf %s "$BASETEN_API_KEY" | pnpm dlx wrangler pages secret put BASETEN_API_KEY --project-name whistle
 printf %s "$GROQ_API_KEY"    | pnpm dlx wrangler pages secret put GROQ_API_KEY --project-name whistle
+printf %s "$WHISTLE_OPENROUTER_KEY" | pnpm dlx wrangler pages secret put WHISTLE_OPENROUTER_KEY --project-name whistle
 
 rm -rf dist && mkdir dist && cp index.html _headers dist/ && cp -r lib dist/
 pnpm dlx wrangler pages deploy dist --project-name whistle --branch main
@@ -119,7 +121,7 @@ aws iam attach-role-policy --role-name whistle-lambda \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
 # 3. keys in an uncommitted file (it is in .gitignore), not on the command line
-echo '{"Variables":{"BASETEN_API_KEY":"...","GROQ_API_KEY":"..."}}' > env.json
+echo '{"Variables":{"BASETEN_API_KEY":"...","GROQ_API_KEY":"...","WHISTLE_OPENROUTER_KEY":"..."}}' > env.json
 
 # 4. function (wait ~10 s after step 2 for the role to propagate)
 aws lambda create-function --function-name whistle --runtime nodejs22.x --handler handler.handler \

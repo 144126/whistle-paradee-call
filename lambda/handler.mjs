@@ -1,6 +1,6 @@
 // AWS Lambda behind a Function URL (invoke mode RESPONSE_STREAM): the same job as server.mjs.
-// Serves index.html and lib/ from the zip, and /api/chat forwards to Baseten or Groq with keys
-// from the function's environment (BASETEN_API_KEY, GROQ_API_KEY).
+// Serves index.html and lib/ from the zip, and /api/chat forwards to Baseten, Groq or OpenRouter
+// with keys from the function's environment (BASETEN_API_KEY, GROQ_API_KEY, WHISTLE_OPENROUTER_KEY).
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable, pipeline } from "node:stream";
@@ -10,6 +10,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PROVIDERS = {
   baseten: { url: "https://inference.baseten.co/v1/chat/completions", key: process.env.BASETEN_API_KEY },
   groq: { url: "https://api.groq.com/openai/v1/chat/completions", key: process.env.GROQ_API_KEY },
+  openrouter: { url: "https://openrouter.ai/api/v1/chat/completions", key: process.env.WHISTLE_OPENROUTER_KEY },
 };
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm" };
 const FIELDS = ["model", "messages", "stream", "max_tokens", "temperature", "reasoning_effort"];

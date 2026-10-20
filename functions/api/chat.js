@@ -1,8 +1,8 @@
 // Cloudflare Pages Function: same job as /api/chat in server.mjs. Set the secrets with
-//   wrangler pages secret put BASETEN_API_KEY      (and GROQ_API_KEY for Groq models)
+//   wrangler pages secret put BASETEN_API_KEY      (GROQ_API_KEY for Groq, WHISTLE_OPENROUTER_KEY for Mercury 3)
 const FIELDS = ["model", "messages", "stream", "max_tokens", "temperature", "reasoning_effort"];
 
-const URLS = { baseten: "https://inference.baseten.co/v1/chat/completions", groq: "https://api.groq.com/openai/v1/chat/completions" };
+const URLS = { baseten: "https://inference.baseten.co/v1/chat/completions", groq: "https://api.groq.com/openai/v1/chat/completions", openrouter: "https://openrouter.ai/api/v1/chat/completions" };
 
 export async function onRequestPost({ request, env }) {
   if (request.headers.get("origin") !== new URL(request.url).origin) return new Response("bad origin", { status: 403 });
@@ -11,7 +11,7 @@ export async function onRequestPost({ request, env }) {
   if (typeof body.model !== "string" || !/^[\w.\-/:]+$/.test(body.model) || !Array.isArray(body.messages)) return new Response("bad request", { status: 400 });
   const name = body.provider ?? "baseten";
   if (!Object.hasOwn(URLS, name)) return new Response("unknown provider", { status: 400 });
-  const key = { baseten: env.BASETEN_API_KEY, groq: env.GROQ_API_KEY }[name];
+  const key = { baseten: env.BASETEN_API_KEY, groq: env.GROQ_API_KEY, openrouter: env.WHISTLE_OPENROUTER_KEY }[name];
   if (!key) return new Response(`no API key for ${name}`, { status: 500 });
   const up = await fetch(URLS[name], {
     method: "POST",
