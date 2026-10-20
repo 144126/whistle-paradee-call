@@ -139,6 +139,16 @@ function sentenceGroups(ps) {
   return groups;
 }
 
+// The first clause of a reply gets its own model call, so audio starts after one short run.
+function utteranceGroups(ps) {
+  const groups = sentenceGroups(ps);
+  const first = ps[0];
+  if (first && groups.length && !/[.!?…]$/.test(first) && groups[0].length > first.length) {
+    groups.splice(0, 1, first, groups[0].slice(first.length + 1));
+  }
+  return groups;
+}
+
 function* chunks(ps) {
   while (ps.length > MAX_PHONEMES) {
     let cut = ps.lastIndexOf(" ", MAX_PHONEMES);
@@ -169,7 +179,7 @@ async function pump() {
       let text = "", last = false;
       while (queue.length && queue[0].id === id) { const q = queue.shift(); text += " " + q.text; last ||= q.last; }
       if (text.trim() && gen === id) {
-        speak: for (const group of sentenceGroups(await phonemizePieces(text.trim()))) {
+        speak: for (const group of utteranceGroups(await phonemizePieces(text.trim()))) {
           for (const ps of chunks(group)) {
             await new Promise((r) => setTimeout(r)); // ONNX awaits never yield to the event loop, so stop would wait for the whole passage
             if (gen !== id) break speak;
@@ -300,9 +310,15 @@ worker.onmessage = ({ data }) => {
 // ---------- speech out ----------
 // Paradee runs in its own worker and streams one sentence at a time.
 let voice, voiceTimer;
-// If the voice is not ready after VOICE_TIMEOUT_MS, retry on one thread: threaded onnxruntime fails
+// Every core but one, so the page and audio playback stay smooth. One thread when not isolated.
+function voiceThreads() {
+  if (!crossOriginIsolated) return 1;
+  return Math.max(1, (navigator.hardwareConcurrency || 1) - 1);
+}
+
+// If the voice is not ready after VOICE_TIMEOUT_MS, retry once on one thread with a fresh worker: threaded onnxruntime fails
 // silently when its worker script is refused (for example a stale cached copy without the isolation headers).
-function startVoice(threads) {
+function startVoice(threads = voiceThreads(), retry = false) {
   voice?.terminate();
   voice = new Worker(blobUrl("voice", true));
   voice.onmessage = onVoice;
@@ -310,8 +326,8 @@ function startVoice(threads) {
   clearTimeout(voiceTimer);
   voiceTimer = setTimeout(() => {
     if (ready.voice) return;
-    if (threads === 1) $("meta").textContent = "The voice is not loading. Hard-reload (Ctrl+Shift+R) or clear this site's data.";
-    else startVoice(1);
+    if (retry) $("meta").textContent = "The voice is not loading. Hard-reload (Ctrl+Shift+R) or clear this site's data.";
+    else startVoice(1, true);
   }, VOICE_TIMEOUT_MS);
 }
 
