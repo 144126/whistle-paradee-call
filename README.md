@@ -226,7 +226,7 @@ sound device unless `ignoreDefaultArgs: ["--mute-audio"]`.
 |---|---|
 | Whistle engine | `huggingface.co/Cactus-Compute/needle3/resolve/c7c415a3d1b3d929014bc6e866d51ebb971f7089/wasm/` (`needle.js`, `needle.wasm`) |
 | Whistle model | `huggingface.co/Cactus-Compute/whistle/resolve/b358ddadd89b7a713b5aa131f23032d3cca1b251/whistle.cact` (16.9 MB) |
-| Paradee TTS | `huggingface.co/sahilmahendrakar/Paradee-8M-v1.0/resolve/c7f83f86c04e84d0ae94cbe1aad7618e0544f80a/` (`onnx/paradee_int8.onnx` 9 MB, `config.json`) |
+| Paradee TTS | `huggingface.co/sahilmahendrakar/Paradee-8M-v1.1/resolve/330617ad1f097b4f6b02c103e54b39006c090b45/` (`onnx/paradee_int8.onnx` 8.5 MB, `config.json`; v1.1, same inputs and vocab as v1.0) |
 
 Both downloads go through the Cache API (`whistle-v1`, `paradee-v1`).
 
