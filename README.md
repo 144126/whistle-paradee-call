@@ -1,21 +1,23 @@
 # Whistle + Paradee in the browser
 
 One static page, `index.html`. Speech in, text out, and text back to speech.
-Speech-to-text and text-to-speech run entirely in the browser: no server, no API, no tunnel (the optional
-**Call** adds a language-model API for the replies). The only network
-use is downloading the model files from Hugging Face, which the browser then caches.
+Speech-to-text and the default voice run entirely in the browser: no server, no API, no tunnel (the optional
+**Call** adds a language-model API for the replies, and the **Voice** picker can swap the on-device voice for a
+remote one). The only network use is downloading the model files from Hugging Face, which the browser then caches.
 
 ## Replicate from scratch
 
 You need Node 20.12 or newer, a Chromium-based browser (Chrome, Edge; Firefox and Safari are untested),
-and, for **Call** only, a Baseten, Groq and/or OpenRouter API key. Dictation and Read aloud need no key at all.
+and, for **Call** and the remote voices only, a Baseten, Groq and/or OpenRouter API key. Dictation and
+Read aloud on the default on-device voice need no key at all.
 
 ```bash
 git clone <this repo> whistle && cd whistle
-export BASETEN_API_KEY=...        # optional, for "Call Baseten"
-export GROQ_API_KEY=...           # optional, for "Call Groq"
+export BASETEN_API_KEY=...         # optional, for "Call Baseten" and the Pocket TTS voices
+export GROQ_API_KEY=...            # optional, for "Call Groq" and the Orpheus voice
 export WHISTLE_OPENROUTER_KEY=...  # optional, for "Call Mercury 3" (OpenRouter inception/mercury-3)
-node server.mjs                   # http://localhost:8123 (no npm install: it has no dependencies)
+export BASETEN_TTS_URL=...         # optional, your own Pocket TTS deployment (see truss-pocket-tts/)
+node server.mjs                    # http://localhost:8123 (no npm install: it has no dependencies)
 ```
 
 Open `http://localhost:8123` (not `file://`: workers are blocked there). Wait for the buttons to leave
@@ -46,8 +48,11 @@ To change the pinned Whistle or Paradee files, edit the URLs near the top of `in
 
 - **Start / Stop**: streaming dictation. Each pause (270 ms of silence) sends the
   segment to Whistle, and the text is appended to the box.
-- **Read aloud**: speaks the text box with Paradee, one sentence at a time.
-  Press again to stop; stopping cancels generation.
+- **Read aloud**: speaks the text box one sentence at a time with whichever voice the
+  **Voice** picker holds. Press again to stop; stopping cancels generation.
+- **Voice**: which engine speaks. `Paradee 8M · on device` is the default and needs no key.
+  The rest are remote and need a key on the server, so they are greyed out without one. See
+  "Voices" below.
 
 - **Call**: a spoken conversation. Whistle transcribes as you talk, and after 1440 ms of
   silence the turn goes to a language model on Baseten. Its reply streams back and is spoken
@@ -86,6 +91,7 @@ pnpm dlx wrangler pages project create whistle --production-branch main
 printf %s "$BASETEN_API_KEY" | pnpm dlx wrangler pages secret put BASETEN_API_KEY --project-name whistle
 printf %s "$GROQ_API_KEY"    | pnpm dlx wrangler pages secret put GROQ_API_KEY --project-name whistle
 printf %s "$WHISTLE_OPENROUTER_KEY" | pnpm dlx wrangler pages secret put WHISTLE_OPENROUTER_KEY --project-name whistle
+printf %s "$BASETEN_TTS_URL" | pnpm dlx wrangler pages secret put BASETEN_TTS_URL --project-name whistle  # Pocket TTS voices
 
 rm -rf dist && mkdir dist && cp index.html _headers dist/ && cp -r lib dist/
 pnpm dlx wrangler pages deploy dist --project-name whistle --branch main
@@ -121,7 +127,7 @@ aws iam attach-role-policy --role-name whistle-lambda \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
 # 3. keys in an uncommitted file (it is in .gitignore), not on the command line
-echo '{"Variables":{"BASETEN_API_KEY":"...","GROQ_API_KEY":"...","WHISTLE_OPENROUTER_KEY":"..."}}' > env.json
+echo '{"Variables":{"BASETEN_API_KEY":"...","GROQ_API_KEY":"...","WHISTLE_OPENROUTER_KEY":"...","BASETEN_TTS_URL":"..."}}' > env.json
 
 # 4. function (wait ~10 s after step 2 for the role to propagate)
 aws lambda create-function --function-name whistle --runtime nodejs22.x --handler handler.handler \
@@ -208,6 +214,77 @@ browser and put only Paradee on a server.
   forcing the language to English makes no difference.
 - **Limits:** history keeps the whole reply even if you interrupted partway. Free OpenRouter has no
   Ling Flash model (only paid), which is why Baseten is used.
+
+## Voices
+
+The **Voice** picker chooses what speaks. One engine is on the device, the rest go out through
+`/api/tts`, which adds the key on the server exactly as `/api/chat` does, so no voice key reaches
+the browser. The page sends one sentence per request and plays each as it lands, so audio starts
+before the whole reply is written; `TTS_MAX_CHARS = 180` keeps every request under Groq's limit.
+
+| Picker label | Where it runs | Needs |
+|---|---|---|
+| `Paradee 8M · on device` | the browser, as before | nothing |
+| `Pocket TTS 18M / 7M / 7M rl / 2M · Baseten` | your own Baseten deployment | `BASETEN_API_KEY` + `BASETEN_TTS_URL` |
+| `Orpheus · Groq` | Groq | `GROQ_API_KEY` |
+
+An option is greyed out until `/api/config` reports its key, and the choice is kept in
+`localStorage`. On a plain static host there is no `/api/tts`, so only the on-device voice appears.
+
+Checked in headless Chromium: all six options present and enabled with both keys set; Read aloud
+completes and returns to idle on the on-device voice, on a Pocket TTS option (against a stand-in
+upstream) and on Orpheus against the real Groq API; stopping mid-sentence leaves nothing running;
+the choice survives a reload; no console warnings or errors. `/api/tts` itself was checked for a
+403 on a foreign origin, 400 on an unknown provider, empty text or a bad voice name, 500 with a
+missing key or no `BASETEN_TTS_URL`, and a clean wav pass-through.
+
+### Kyutai Pocket TTS
+
+Announced 2026-10-20: the ~100M Pocket TTS shrunk to 18.2M, 6.9M and 1.9M, each also in a
+`_refl` variant fine-tuned with rewards for naturalness and intelligibility, all with voice
+cloning. Kyutai's claim is 103x faster than real time on one CPU core for the 1.9M model.
+[Weights](https://huggingface.co/kyutai/pocket-tts) ·
+[code](https://github.com/kyutai-labs/pocket-tts) ·
+[blog](https://kyutai.org/blog/2026-10-20-pocket-tts-small).
+
+**Baseten does not carry Pocket TTS in its model library**, and Groq does not host custom weights
+at all, so there is no managed endpoint to call. `truss-pocket-tts/` is a Truss that serves every
+size from one CPU deployment; `BASETEN_TTS_URL` is that deployment's predict URL:
+
+```bash
+pipx install truss
+cd truss-pocket-tts
+baseten secrets create hf_access_token   # kyutai/pocket-tts is a gated repo: ask for access first
+truss push --publish
+export BASETEN_TTS_URL=https://model-<id>.api.baseten.co/environments/production/predict
+```
+
+It takes `{text, language, voice}` and returns a 16-bit mono wav. `language` is the model name the
+page sends (`english_18m_2026-10`, `english_7m_2026-10`, `english_7m_refl_2026-10`,
+`english_2m_2026-10`); `voice` is a built-in name (default `alba`) or, with the gated weights, a
+reference wav for cloning. Models are loaded lazily and kept, so one deployment serves all four
+sizes; the default is warmed in `load()`.
+
+**Be clear about what this buys.** Pocket TTS is small enough that a network round trip costs more
+than the synthesis: a 2M model at 103x real time makes 9 s of audio in about 90 ms, while reaching
+Baseten and back is 200-500 ms, and a scale-to-zero deployment adds a cold start on top. These
+options exist to compare the voices and to keep the device free, not to go faster than the local
+voice. The version worth having is Pocket TTS **in the browser**, next to Paradee: Kyutai say it is
+small enough for WebAssembly but ship no official build, and `onnxruntime-web` is already vendored
+in `lib/`, so a community ONNX export (`pocket-tts-onnx-export`) or the Rust/WASM port is the
+path. Not done here.
+
+### Orpheus on Groq
+
+Groq's only text-to-speech is Canopy Labs Orpheus, so "a Kyutai voice on Groq" is not available;
+this is a real remote voice through the same route. `canopylabs/orpheus-v1-english`, voices
+`autumn, diana, hannah, austin, daniel, troy`, `response_format: "wav"`, and bracketed directions
+such as `[cheerful]` steer the delivery. Input is capped at 200 characters.
+
+Measured through `/api/tts` on this key: a 40-character sentence returned 3.52 s of 24 kHz mono
+PCM in 1.33 s. The docs do not state a rate and third-party ones claim 48 kHz, so the page reads
+the real rate out of the wav header (bytes 24-27) and builds the AudioContext at it; nothing is
+resampled either way.
 
 ## Audio quality: what was checked
 

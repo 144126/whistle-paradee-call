@@ -1,0 +1,21 @@
+model_name: pocket-tts
+# Pocket TTS is tiny and CPU-only: the largest model here is 18.2M parameters and the Rust/Python
+# runtime needs no GPU. Do not switch this to a GPU instance, it would only add cost and cold start.
+resources:
+  cpu: "2"
+  memory: 4Gi
+  use_gpu: false
+runtime:
+  predict_concurrency: 4
+requirements:
+  - --extra-index-url https://download.pytorch.org/whl/cpu
+  - torch==2.14.1+cpu
+  - pocket-tts
+  - numpy
+# kyutai/pocket-tts is a gated repo: ask for access at https://huggingface.co/kyutai/pocket-tts,
+# then `baseten secrets create hf_access_token` with a token on that account. The ungated
+# kyutai/pocket-tts-without-voice-cloning needs no token but drops the voice-cloning encoder.
+secrets:
+  hf_access_token: null
+environment_variables:
+  POCKET_TTS_DEFAULT: english_18m_2026-10

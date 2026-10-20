@@ -12,6 +12,8 @@
   details { margin-top: 1rem; font-size: 15px; }
   details p { margin: .5rem 0; }
   input[type=password], input[type=text] { font: inherit; padding: .3rem; width: 24rem; max-width: 100%; }
+  select { font: inherit; padding: .45rem; border-radius: .6rem; border: 1px solid; background: #fff; }
+  #voicerow { display: inline-block; margin-left: .8rem; font-size: 15px; color: #444; }
   #meta { color: #888; font-size: 14px; margin-left: .8rem; }
   #chat p { margin: .4rem 0; }
   .note { color: #888; }
@@ -22,6 +24,7 @@
 <button id="call_groq" aria-pressed="false" disabled>Call Groq</button>
 <button id="call_mercury" aria-pressed="false" disabled>Call Mercury 3</button>
 <button id="mute" aria-pressed="false" disabled>Mute</button>
+<label id="voicerow">Voice <select id="engine"></select></label>
 <span id="meta"></span>
 <details id="settings">
   <summary>Call settings</summary>
@@ -260,21 +263,80 @@ $("model").onchange = () => store.set("model", $("model").value.trim());
 $("barge").checked = store.get("barge", "") === "1";
 $("barge").onchange = () => store.set("barge", $("barge").checked ? "1" : "");
 
+// ---------- the voices ----------
+// Paradee runs on the device. The rest are remote: Kyutai's Pocket TTS on your own Baseten
+// deployment (Baseten's library does not carry it), and Orpheus on Groq, which is the only
+// voice Groq hosts. `rate` is each one's own output rate and is only a hint: the real rate comes
+// from the wav header, and the AudioContext is built at it so nothing is ever resampled.
+const PROVIDER_NAME = { baseten: "Baseten", groq: "Groq", openrouter: "OpenRouter" };
+const VOICES = {
+  paradee:        { label: "Paradee 8M · on device",     rate: 24000, local: true },
+  pocket_18m:     { label: "Pocket TTS 18M · Baseten",   rate: 24000, provider: "baseten", model: "english_18m_2026-10" },
+  pocket_7m:      { label: "Pocket TTS 7M · Baseten",    rate: 24000, provider: "baseten", model: "english_7m_2026-10" },
+  pocket_7m_refl: { label: "Pocket TTS 7M rl · Baseten", rate: 24000, provider: "baseten", model: "english_7m_refl_2026-10" },
+  pocket_2m:      { label: "Pocket TTS 2M · Baseten",    rate: 24000, provider: "baseten", model: "english_2m_2026-10" },
+  orpheus:        { label: "Orpheus · Groq",             rate: 24000, provider: "groq", model: "canopylabs/orpheus-v1-english", voice: "autumn" },
+};
+const TTS_MAX_CHARS = 180; // Groq's Orpheus rejects input over 200 characters
+
+let engine = store.get("engine", "paradee");
+if (!VOICES[engine]) engine = "paradee";
+const local = () => Boolean(VOICES[engine].local);
+// the on-device voice has to finish loading; a remote one only needs its key on the server
+const voiceReady = () => (local() ? ready.voice : Boolean(serverTts[VOICES[engine].provider]));
+
+function buildEngines() {
+  const sel = $("engine");
+  sel.textContent = "";
+  for (const [name, v] of Object.entries(VOICES)) {
+    const o = document.createElement("option");
+    o.value = name;
+    o.textContent = v.label;
+    o.disabled = !v.local && !serverTts[v.provider];
+    sel.append(o);
+  }
+  // only once /api/config has answered: before that every remote voice looks keyless
+  if (configured && !VOICES[engine].local && !serverTts[VOICES[engine].provider]) engine = "paradee";
+  sel.value = engine;
+}
+
+// one place that decides whether the page can speak, and says why not
+function readable() {
+  const ok = voiceReady();
+  $("read").disabled = !ok || Boolean(call);
+  $("read").textContent = speakId ? "Stop reading"
+    : ok ? "Read aloud"
+    : local() ? "Loading voice…"
+    : `No ${PROVIDER_NAME[VOICES[engine].provider]} voice key`;
+  refresh();
+}
+
+$("engine").onchange = () => {
+  stopReading();
+  engine = $("engine").value;
+  store.set("engine", engine);
+  audioOut(); // rebuilt at the new rate before the first sentence, not during it
+  readable();
+};
+
 // When the page is served by server.mjs (or a deployed /api/chat), that server holds the Baseten key
 // and forwards the calls, so the key never reaches the browser. Otherwise the pasted key is used.
-let serverKey = false, serverGroq = false, serverOpenRouter = false;
+let serverKey = false, serverGroq = false, serverOpenRouter = false, serverTts = {}, configured = false;
 fetch("/api/config").then((r) => (r.ok ? r.json() : {})).then((c) => {
+  configured = true;
   serverKey = Boolean(c.key);
   serverGroq = Boolean(c.providers?.groq);
   serverOpenRouter = Boolean(c.providers?.openrouter);
-  refresh();
+  serverTts = c.tts ?? {};
+  buildEngines();
+  readable();
   if (!serverKey) return;
   $("keyrow").hidden = true;
   $("keynote").textContent = "Replies go through this page's server, which holds the Baseten key; it never reaches the browser. What you say goes to the model as text; audio never leaves this device.";
 }).catch(() => {});
 
 const ready = { whistle: false, voice: false };
-const refresh = () => { if (ready.whistle && ready.voice) { $("call").disabled = false; $("call_groq").disabled = !serverGroq; $("call_mercury").disabled = !serverOpenRouter; } };
+const refresh = () => { if (ready.whistle && voiceReady() && !call) { $("call").disabled = false; $("call_groq").disabled = !serverGroq; $("call_mercury").disabled = !serverOpenRouter; } };
 
 let call = null;       // the live call, or null
 let pendingAsr = 0;    // segments sent to Whistle and not yet transcribed
@@ -318,12 +380,20 @@ function startVoice(threads) {
 }
 
 let playCtx = null, nextAt = 0, sources = [], speakId = 0, generated = false, seq = 0, speaking = false;
+let rq = { id: 0, buf: "", busy: false, done: false, abort: null }; // the remote voice's queue
 
-// Paradee outputs 24 kHz. A context at any other rate makes Chrome resample every buffer with
-// linear interpolation, which adds imaging distortion (measured: 0.35% of energy above 12 kHz).
-function audioOut() {
+// Paradee outputs 24 kHz, and the remote voices have their own rates. A context at any other rate
+// makes Chrome resample every buffer with linear interpolation, which adds imaging distortion
+// (measured: 0.35% of energy above 12 kHz), so the context is always built at the voice's own rate.
+// Switching rate means a new context, which is only safe while nothing is scheduled.
+function audioOut(rate = VOICES[engine].rate) {
+  if (playCtx && playCtx.sampleRate !== rate && !sources.length) {
+    playCtx.close().catch(() => {});
+    playCtx = null;
+    nextAt = 0;
+  }
   if (!playCtx) {
-    try { playCtx = new AudioContext({ sampleRate: 24000, latencyHint: "playback" }); }
+    try { playCtx = new AudioContext({ sampleRate: rate, latencyHint: "playback" }); }
     catch { playCtx = new AudioContext({ latencyHint: "playback" }); }
   }
   return playCtx;
@@ -337,7 +407,7 @@ function play(samples) {
   const gain = Math.min(VOICE_GAIN, 0.95 / (peak || 1));
   for (let i = 0; i < samples.length; i++) samples[i] *= gain;
   const ctx = audioOut();
-  const buf = ctx.createBuffer(1, samples.length, 24000);
+  const buf = ctx.createBuffer(1, samples.length, ctx.sampleRate);
   buf.copyToChannel(samples, 0);
   const src = ctx.createBufferSource();
   src.buffer = buf;
@@ -358,7 +428,9 @@ function stopReading() {
   speakId = 0;
   generated = false;
   speaking = false;
-  voice.postMessage({ type: "stop" });
+  voice.postMessage({ type: "stop" }); // both are stopped, so a voice switch mid-sentence leaves nothing running
+  rq.abort?.abort();
+  rq = { id: 0, buf: "", busy: false, done: false, abort: null };
   sources.forEach((s) => { s.onended = null; try { s.stop(); } catch {} });
   sources = [];
   nextAt = 0;
@@ -375,22 +447,97 @@ function finished() {
 }
 
 function onVoice({ data }) {
-  if (data.type === "ready") { ready.voice = true; clearTimeout(voiceTimer); $("read").disabled = false; $("read").textContent = "Read aloud"; refresh(); }
+  if (data.type === "ready") { ready.voice = true; clearTimeout(voiceTimer); readable(); }
   else if (data.type === "error") $("meta").textContent = data.message;
   else if (data.type === "audio" && data.id === speakId) play(data.samples);
   else if (data.type === "done" && data.id === speakId) { generated = true; if (!sources.length) finished(); }
 }
 startVoice();
 
+// ---------- the remote voices ----------
+// A wav header carries the real sample rate at bytes 24-27. The context is built at it, so neither
+// decoding nor playback resamples. Anything that is not a RIFF wav falls back to the voice's hint.
+function wavRate(bytes) {
+  if (bytes.byteLength < 28) return 0;
+  const d = new DataView(bytes);
+  if (d.getUint32(0, false) !== 0x52494646) return 0; // "RIFF"
+  const r = d.getUint32(24, true);
+  return r >= 8000 && r <= 192000 ? r : 0;
+}
+
+async function fetchVoice(text) {
+  const v = VOICES[engine];
+  const res = await fetch("/api/tts", {
+    method: "POST",
+    signal: rq.abort.signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: v.provider, model: v.model, text, ...(v.voice && { voice: v.voice }) }),
+  });
+  if (!res.ok) throw new Error(`${PROVIDER_NAME[v.provider]} voice ${res.status}: ${(await res.text()).slice(0, 160)}`);
+  const bytes = await res.arrayBuffer();
+  const buf = await audioOut(wavRate(bytes) || v.rate).decodeAudioData(bytes);
+  return buf.getChannelData(0);
+}
+
+// One sentence per request, and the tail only once the text is complete, so audio starts before
+// the whole reply is written. A sentence over the provider's limit is cut at a word.
+function takePiece() {
+  const m = rq.buf.match(/^[\s\S]*?[.!?…](?=\s|$)/);
+  let piece = m ? m[0] : rq.done ? rq.buf : "";
+  if (!piece.trim()) return "";
+  let rest = rq.buf.slice(piece.length);
+  if (piece.length > TTS_MAX_CHARS) {
+    let cut = piece.lastIndexOf(" ", TTS_MAX_CHARS);
+    if (cut <= 0) cut = TTS_MAX_CHARS;
+    rest = piece.slice(cut) + rest;
+    piece = piece.slice(0, cut);
+  }
+  rq.buf = rest.trim();
+  return piece.trim();
+}
+
+async function remotePump() {
+  if (rq.busy) return;
+  rq.busy = true;
+  const id = rq.id;
+  try {
+    for (let piece; (piece = takePiece()); ) {
+      if (id !== speakId) break; // text that arrived while a request was in flight can out-run a stop
+      rq.abort = new AbortController();
+      const samples = await fetchVoice(piece);
+      if (id !== speakId) break;
+      play(samples);
+    }
+    if (rq.done && !rq.buf.trim() && id === speakId) { generated = true; if (!sources.length) finished(); }
+  } catch (e) {
+    if (e.name !== "AbortError") { $("meta").textContent = "voice: " + (e.message || e); stopReading(); }
+  }
+  rq.busy = false;
+}
+
+function remoteSpeak(id, text, last) {
+  if (id !== rq.id) { rq.abort?.abort(); rq = { id, buf: "", busy: false, done: false, abort: null }; }
+  rq.buf = (rq.buf + " " + text).trim();
+  rq.done ||= last;
+  remotePump();
+}
+
+// Paradee streams out of its worker; a remote voice is fetched a sentence at a time. Either way
+// the caller just hands over text as it arrives and marks the last piece.
+function speak(id, text, last) {
+  if (local()) voice.postMessage({ type: "speak", id, text, last });
+  else remoteSpeak(id, text, last);
+}
+
 $("read").onclick = () => {
-  if (speakId) { stopReading(); return; }
+  if (speakId) { stopReading(); readable(); return; }
   const text = $("out").value.trim();
   if (!text) { $("meta").textContent = "Nothing to read yet"; return; }
   audioOut().resume();
   live?.seg.flush(); // the mic is ignored while reading, otherwise the speaker output gets transcribed
   speakId = ++seq;
   $("read").textContent = "Stop reading";
-  voice.postMessage({ type: "speak", id: speakId, text, last: true });
+  speak(speakId, text, true);
 };
 
 // ---------- speech in ----------
@@ -597,7 +744,7 @@ async function fire() {
   c.abort = new AbortController();
   const id = (speakId = ++seq);
   generated = false;
-  const say = (text, last) => voice.postMessage({ type: "speak", id, text, last });
+  const say = (text, last) => speak(id, text, last);
   const messages = [{ role: "system", content: SYSTEM }, ...c.history, { role: "user", content: user }];
   const t0 = performance.now();
   let buf = "", started = false;
@@ -629,7 +776,6 @@ async function fire() {
 }
 
 const CALLS = { baseten: ["call", "Call Baseten"], groq: ["call_groq", "Call Groq"], openrouter: ["call_mercury", "Call Mercury 3"] };
-const PROVIDER_NAME = { baseten: "Baseten", groq: "Groq", openrouter: "OpenRouter" };
 const FIXED_MODEL = { groq: "openai/gpt-oss-120b", openrouter: "inception/mercury-3" }; // the others use the model box
 
 function setCallUi(on) {
@@ -640,10 +786,11 @@ function setCallUi(on) {
     $(id).disabled = on && !mine;
   }
   $("mic").disabled = on;
-  $("read").disabled = on;
+  $("engine").disabled = on; // switching voice mid-call would cut the reply being spoken
   $("mute").disabled = !on;
   $("mute").textContent = "Mute";
   $("mute").setAttribute("aria-pressed", "false");
+  readable();
 }
 
 // a disabled mic track sends silence, so the segmenter just sees no speech
@@ -691,4 +838,7 @@ async function start_call(provider) {
 $("call").onclick = () => start_call("baseten");
 $("call_groq").onclick = () => start_call("groq");
 $("call_mercury").onclick = () => start_call("openrouter");
+
+buildEngines(); // the remote voices turn on when /api/config says their key is there
+readable();
 </script>
