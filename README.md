@@ -287,15 +287,69 @@ matter before anyone designs around that number:
 - **The headline parameter counts are the transformer only.** `english_2m` is 0.88M in `flow_lm`,
   but the Mimi encoder/decoder it needs is another 10.79M, so the real model is 11.67M and the
   checkpoint is 46.7 MB. Peak RSS was 528-538 MB. "1.9M" is not the thing you run.
-- **This measures the PyTorch path.** The repo also ships a Rust port (`rust/`, on `xn-ptts`) and
-  there are community ONNX, C++ and MLX builds. The 103x figure is most likely one of those on
-  newer hardware, not `pocket-tts` on x86 torch — but that is inference, not something checked here.
+- **This measures the PyTorch path**, and the obvious suspect for the gap — a compiled runtime —
+  turned out to be *slower* here, not faster. See "Phonon" below: the Rust engine at `xn-ptts` is
+  2.4x slower than this PyTorch path on one core of this laptop. So the 103x figure is not explained
+  by "it was the Rust build"; it would have to be much newer hardware, a different text, or a
+  measurement that excludes the Mimi decode.
 - **The repo's own numbers agree with mine, not with the post.** Its README says ~6x real time on a
   MacBook Air M4 CPU, and RTF ~2.3-2.5x on a 4-vCPU x86 VM. The 18M result here, 2.46x, lands on
   that second figure.
 
 More threads did not help: the 2M model went *down* from 4.61x to 4.34x on 8 threads. These models
 are too small to parallelise usefully, which is consistent with Kyutai's one-core framing.
+
+The two speed knobs the library exposes are both dead ends. `sampler_decode_steps` is already at its
+fastest default of 1 (`default_parameters.py:5`; the `lsd` flow head is one-step by design, unlike
+`flow_matching`, which needs 16 or more). And `quantize=True` — int8 dynamic on the `flow_lm`
+attention and FFN, whose docstring claims "about 27% faster on x86" — did not deliver: median RTF
+went 3.87x → 3.29x, inside the run-to-run spread, with peak RSS unchanged at about 485 MB. The
+backend was `torch.ao` with the x86/FBGEMM engine; `torchao`, which that code prefers when present,
+was not installed, so the docstring's figure may belong to that path. 64 linear modules were
+quantized, so it did apply.
+
+Nothing else is tunable for speed: there is no float16/bfloat16 option (both `flow_lm` and Mimi are
+pinned to `float32` in `english.yaml`), no `torch.compile`, and `torch.set_num_threads(1)` runs at
+import time in `models/tts_model.py:56`, so a thread setting applied before the import is silently
+discarded — which is how the first attempt here produced an invalid all-core figure.
+
+### Phonon, the other small one
+
+[Phonon](https://gradium.ai/phonon) (Gradium) is the nearest alternative and shares ancestry with
+this: its runtime, [`xn-ptts`](https://github.com/gradium-ai/xn-ptts), is a Rust engine whose
+acknowledgements say it builds heavily on Kyutai's continuous audio language model work, and it
+reads Pocket TTS checkpoints that ship a `config.json`. Phonon 31m is Apache-2.0; the 40m models are
+CC BY-NC. It installs as a 9.3 MB prebuilt binary with no Python, and — unlike Pocket TTS — ships an
+npm WASM build, which is the only one of the two that could join Paradee in the browser.
+
+Measured on the same laptop, same text, interleaved A/B so load drift hits both equally (8 timed
+cycles each, `taskset -c 0`, one thread, RTF = audio / generation, higher is faster):
+
+| engine | median RTF | min-max | peak RSS MB | weights MB |
+|---|---|---|---|---|
+| Pocket TTS 2M, torch f32 | **3.87x** | 3.02-4.40 | 484 | 47.3 |
+| Pocket TTS 2M, torch int8 | 3.29x | 2.26-4.19 | 487 | 47.3 |
+| Phonon 31m, f32 | 1.62x | 1.33-1.88 | 377 | 103.4 |
+| Phonon 31m, `--quant q8` | 1.95x | 1.30-2.39 | 257 | 64.5 |
+| Phonon 31m, `--quant q4k` | 2.51x | 2.31-2.62 | 272 | 55.1 |
+
+**Pocket TTS is 2.4x faster on one core, and the f32 ranges do not overlap**, so that gap is real
+and not load noise. It is also the smaller download (47 MB against 103 MB). Phonon's quantization
+buys memory rather than speed — q8 cut peak RSS from 377 MB to 257 MB with non-overlapping ranges,
+while its RTF change stayed inside the spread.
+
+Two things this does not say. Quality was not compared: Gradium publishes 1.70% WER for Phonon 31m
+against Kokoro's 3.50%, and a 2M model beating a 31M one on speed should be expected to lose on
+quality, so the samples in `~/Downloads/tts-ab-samples/` want a listen before any choice. And
+Phonon's own claims are for hardware this laptop is not: 26x on one MacBook Air M5 core, 22x on an
+iPhone 16 Pro Neural Engine, 2.3x on one Raspberry Pi 5 core — that last figure is the one closest
+to this machine's class, and it is in the same range as what was measured here.
+
+`ptts` cannot load the public `kyutai/pocket-tts-without-voice-cloning` weights
+(`Error: config.json is not in hf://...`), so each engine was timed in its own runtime; that is the
+one way this comparison is not apples to apples. The machine also carried unrelated load
+(1-min average 4.7-11.3 on 4 cores) throughout, which is why the A/B was interleaved and why the
+min-max columns matter more than the medians.
 
 Measured on the public `kyutai/pocket-tts-without-voice-cloning` weights, because the gated repo was
 not accessible; the architecture is the same but these figures are not guaranteed to match the gated
