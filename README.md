@@ -61,7 +61,7 @@ Start/Stop dictation and Read aloud are unchanged.
 
 ## The call
 
-The **groq model** dropdown selects the model for **Call Groq** and remembers it in this browser. It lists eight conversational models from Groq's current catalog and live Models API, grouped by production, preview, and enterprise access. Enterprise models need an eligible account. GPT-OSS uses low reasoning effort; Qwen uses non-thinking mode for quick spoken replies. Speech and moderation models are not conversation models and stay out of this selector.
+The **groq model** dropdown selects the model for **Call Groq** and remembers it in this browser. It lists all eight models in [Groq's function-calling support table](https://console.groq.com/docs/tool-use/overview#supported-models), plus Allam from the live Models API. Safeguard is labeled as a safety model; enterprise models need an eligible account. GPT-OSS uses low reasoning effort; Qwen uses non-thinking mode for quick spoken replies. Speech and Prompt Guard classifiers stay out of this selector. Selecting a model does not add tool execution to Whistle's conversation loop.
 
 Press Call. With `server.mjs` running there is nothing to paste: the page asks `/api/config`
 whether the server holds a key, hides the key field if so, and posts the conversation to
