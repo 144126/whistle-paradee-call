@@ -242,7 +242,8 @@ missing key or no `BASETEN_TTS_URL`, and a clean wav pass-through.
 
 Announced 2026-10-20: the ~100M Pocket TTS shrunk to 18.2M, 6.9M and 1.9M, each also in a
 `_refl` variant fine-tuned with rewards for naturalness and intelligibility, all with voice
-cloning. Kyutai's claim is 103x faster than real time on one CPU core for the 1.9M model.
+cloning. Kyutai's claim is 103x faster than real time on one CPU core for the 1.9M model, which did
+not reproduce here (measured 2.46-4.61x, see "Benchmarked here" below).
 [Weights](https://huggingface.co/kyutai/pocket-tts) ·
 [code](https://github.com/kyutai-labs/pocket-tts) ·
 [blog](https://kyutai.org/blog/2026-10-20-pocket-tts-small).
@@ -265,14 +266,48 @@ page sends (`english_18m_2026-10`, `english_7m_2026-10`, `english_7m_refl_2026-1
 reference wav for cloning. Models are loaded lazily and kept, so one deployment serves all four
 sizes; the default is warmed in `load()`.
 
-**Be clear about what this buys.** Pocket TTS is small enough that a network round trip costs more
-than the synthesis: a 2M model at 103x real time makes 9 s of audio in about 90 ms, while reaching
-Baseten and back is 200-500 ms, and a scale-to-zero deployment adds a cold start on top. These
-options exist to compare the voices and to keep the device free, not to go faster than the local
-voice. The version worth having is Pocket TTS **in the browser**, next to Paradee: Kyutai say it is
-small enough for WebAssembly but ship no official build, and `onnxruntime-web` is already vendored
-in `lib/`, so a community ONNX export (`pocket-tts-onnx-export`) or the Rust/WASM port is the
-path. Not done here.
+### Benchmarked here, and the 103x claim
+
+Run locally on this laptop (i7-8565U, 4 cores / 8 threads) with `pocket-tts` 4.0.0 and
+`torch 2.14.1+cpu`, median of 5 generations per text, one core
+(`OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 taskset -c 0` and `torch.set_num_threads(1)`):
+
+| model | params, flow_lm only | ckpt MB | load s | gen s short / med / long | RTF long, 1 core | RTF long, 8 threads | peak RSS MB |
+|---|---|---|---|---|---|---|---|
+| `english_2m_2026-10` | 0.88M (11.67M total) | 46.7 | 0.32 | 0.77 / 2.95 / 7.48 | 4.61x | 4.34x | 528-538 |
+| `english_7m_2026-10` | 4.25M (16.61M total) | 66.5 | 0.40 | 1.08 / 3.65 / 10.56 | 3.39x | not run | 643 |
+| `english_7m_refl_2026-10` | 4.25M (16.61M total) | 66.5 | 0.52 | 0.96 / 3.72 / 10.63 | 3.49x | not run | 674 |
+| `english_18m_2026-10` | 15.56M (27.92M total) | 111.7 | 1.60 | 1.37 / 4.97 / 14.65 | 2.46x | 2.68x | 692-762 |
+
+All four output 24 kHz. Texts were 12, 47 and 128 words, the same for every model.
+
+**The 103x did not reproduce: 2.46x to 4.61x on one core.** Three things explain the gap, and they
+matter before anyone designs around that number:
+
+- **The headline parameter counts are the transformer only.** `english_2m` is 0.88M in `flow_lm`,
+  but the Mimi encoder/decoder it needs is another 10.79M, so the real model is 11.67M and the
+  checkpoint is 46.7 MB. Peak RSS was 528-538 MB. "1.9M" is not the thing you run.
+- **This measures the PyTorch path.** The repo also ships a Rust port (`rust/`, on `xn-ptts`) and
+  there are community ONNX, C++ and MLX builds. The 103x figure is most likely one of those on
+  newer hardware, not `pocket-tts` on x86 torch — but that is inference, not something checked here.
+- **The repo's own numbers agree with mine, not with the post.** Its README says ~6x real time on a
+  MacBook Air M4 CPU, and RTF ~2.3-2.5x on a 4-vCPU x86 VM. The 18M result here, 2.46x, lands on
+  that second figure.
+
+More threads did not help: the 2M model went *down* from 4.61x to 4.34x on 8 threads. These models
+are too small to parallelise usefully, which is consistent with Kyutai's one-core framing.
+
+Measured on the public `kyutai/pocket-tts-without-voice-cloning` weights, because the gated repo was
+not accessible; the architecture is the same but these figures are not guaranteed to match the gated
+build. Voice cloning was not exercised.
+
+**So what is this worth?** Not a speed win. At 2.5-4.6x real time on a CPU, a Baseten deployment of
+Pocket TTS lands in the same range as Paradee already does in the browser (about 0.2-0.3 s per second
+of audio), and slower end to end than Orpheus on Groq measured above. What the remote options give
+is a voice comparison, voice cloning, and keeping the device free — not lower latency. A browser
+build next to Paradee (`onnxruntime-web` is already vendored in `lib/`; Kyutai say WebAssembly is
+feasible but ship no official build) is still the interesting direction, but on these numbers it
+would roughly match the voice already there rather than beat it. Not done here.
 
 ### Orpheus on Groq
 
