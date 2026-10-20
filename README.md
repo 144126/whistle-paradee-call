@@ -281,10 +281,27 @@ this is a real remote voice through the same route. `canopylabs/orpheus-v1-engli
 `autumn, diana, hannah, austin, daniel, troy`, `response_format: "wav"`, and bracketed directions
 such as `[cheerful]` steer the delivery. Input is capped at 200 characters.
 
-Measured through `/api/tts` on this key: a 40-character sentence returned 3.52 s of 24 kHz mono
-PCM in 1.33 s. The docs do not state a rate and third-party ones claim 48 kHz, so the page reads
-the real rate out of the wav header (bytes 24-27) and builds the AudioContext at it; nothing is
-resampled either way.
+The docs do not state a sample rate and third-party ones claim 48 kHz. Measured: 24 kHz mono
+`pcm_s16le`. The page therefore reads the real rate out of the wav header (bytes 24-27) and builds
+the AudioContext at it, so nothing is resampled whichever it turns out to be.
+
+Measured through `/api/tts` on this key, median of 3 runs after a warm-up, `autumn`:
+
+| input | wall | audio out | faster than real time |
+|---|---|---|---|
+| 28 chars | 0.82 s | 3.04 s | 3.7x |
+| 140 chars | 1.73 s | 9.20 s | 5.3x |
+| 276 chars | 3.34 s | 20.24 s | 6.0x |
+
+Two things the docs do not tell you. **The first call after an idle period took 18.68 s**, against
+0.82 s warm, so the opening turn of a call on this voice can stall badly. And the 200-character
+cap is not enforced: the 276-character request returned normally. `TTS_MAX_CHARS = 180` stays
+conservative anyway, because one sentence per request is what makes audio start early.
+
+For scale: the page sends a sentence at a time, so what matters is the 0.8-1.7 s per sentence
+above, not the throughput figure. Paradee in the browser reaches first audio in about 3.8 s on a
+4.4 s sentence (see "Measured", below), so on this laptop Orpheus actually starts speaking sooner
+than the on-device voice, cold starts aside.
 
 ## Audio quality: what was checked
 
