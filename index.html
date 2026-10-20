@@ -100,22 +100,35 @@ const MAP = [["aɪ","I"],["aʊ","W"],["eɪ","A"],["oʊ","O"],["ɔɪ","Y"],["dʒ"
   ["ɜː","ɜɹ"],["əl","ᵊl"],["ʲo","jo"],["ʲə","jə"],["ʲ",""],["r","ɹ"],["x","k"],["ç","k"],["ɐ","ə"],
   ["ɬ","l"],["̃",""],["ɾ","T"],["ʔ","t"],["ː",""],["̩",""]];
 
-let ort, phonemize, session, vocab, base, threads, gen = 0, queue = [], busy = false;
+let ort, phonemize, session, vocab, base, threads, gen = 0, queue = [], busy = false, led = 0;
 
 async function init() {
   ort = await import(base + "lib/ort.wasm.min.mjs");
   ort.env.wasm.wasmPaths = base + "lib/";
-  if (threads) ort.env.wasm.numThreads = threads;
+  // Measured on this model, one core each: 1 thread 7.4x real time, 2 threads 10.1x, 4 threads
+  // 12.0x, 8 threads 10.1x. So ask for 4 and never more. onnxruntime's own default is
+  // min(4, cores/2), which picks 2 on a four-core machine and leaves half the gain unclaimed.
+  ort.env.wasm.numThreads = threads;
   ({ phonemize } = await import(base + "lib/phonemizer.js"));
   const [cfg, model] = await Promise.all([
     get(MODEL + "config.json", "paradee-v1").then(r => r.json()),
-    get(MODEL + "onnx/paradee_int8.onnx", "paradee-v1").then(r => r.arrayBuffer()),
+    // the fp32 weights, not paradee_int8.onnx: int8 is 4.1x smaller but measured 6% slower on one
+    // thread and 10% slower on four, because this backend pays more to dequantise than it saves
+    get(MODEL + "onnx/paradee.onnx", "paradee-v1").then(r => r.arrayBuffer()),
   ]);
   vocab = cfg.vocab;
-  session = await ort.InferenceSession.create(new Uint8Array(model));
+  session = await ort.InferenceSession.create(new Uint8Array(model), {
+    executionProviders: ["wasm"],
+    graphOptimizationLevel: "all",
+    enableMemPattern: true,
+    enableCpuMemArena: true,
+    executionMode: "sequential", // the wasm backend does not implement parallel execution
+  });
 }
 
-// One phonemize() call for all clauses: each call costs about 650 ms in the browser, mostly fixed.
+// One phonemize() call for all clauses. Measured here, a warm call costs 1.6-1.9 ms plus 0.18 ms
+// per character, so this is cheap; the ~0.7 s once blamed on it is all one-time (import, first
+// call, then a tail of about 28 calls before espeak settles), and init below pays that up front.
 // phonemize() returns one entry per clause and drops punctuation, so each piece keeps its own mark.
 async function phonemizePieces(text) {
   const pieces = text.split(/(?<=[.!?…,;:])\s+|\n+/).map((s) => s.trim()).filter(Boolean);
@@ -131,16 +144,22 @@ async function phonemizePieces(text) {
   }).filter((ps) => ps.length > 0);
 }
 
-// one model call per sentence keeps its intonation
-function sentenceGroups(ps) {
+// One model call per sentence keeps its intonation. The first call of an utterance is the exception:
+// it is cut at the first clause. Synthesis costs about 0.074 s per second of audio, so a whole
+// opening sentence means roughly a second of silence before anything plays, where its first clause
+// means about a tenth of that. Later sentences stay whole, and their audio queues behind what is
+// already playing, so nothing after the opening clause pays for this.
+const LEAD_MIN = 12; // phonemes; a shorter lead clause is not worth its own call
+function sentenceGroups(ps, lead) {
   const groups = [];
   let group = [];
   for (const p of ps) {
     group.push(p);
-    if (/[.!?…]$/.test(p)) { groups.push(group.join(" ")); group = []; }
+    if (/[.!?…]$/.test(p)) { groups.push(group); group = []; }
   }
-  if (group.length) groups.push(group.join(" "));
-  return groups;
+  if (group.length) groups.push(group);
+  if (lead && groups[0]?.length > 1 && groups[0][0].length >= LEAD_MIN) groups.splice(0, 1, [groups[0][0]], groups[0].slice(1));
+  return groups.map((g) => g.join(" "));
 }
 
 function* chunks(ps) {
@@ -173,11 +192,12 @@ async function pump() {
       let text = "", last = false;
       while (queue.length && queue[0].id === id) { const q = queue.shift(); text += " " + q.text; last ||= q.last; }
       if (text.trim() && gen === id) {
-        speak: for (const group of sentenceGroups(await phonemizePieces(text.trim()))) {
+        speak: for (const group of sentenceGroups(await phonemizePieces(text.trim()), id !== led)) {
           for (const ps of chunks(group)) {
             await new Promise((r) => setTimeout(r)); // ONNX awaits never yield to the event loop, so stop would wait for the whole passage
             if (gen !== id) break speak;
             const samples = await synth(ps);
+            led = id; // this utterance has started, so later sentences are not cut at a clause
             postMessage({ type: "audio", id, samples }, [samples.buffer]);
           }
         }
@@ -196,8 +216,11 @@ onmessage = async ({ data }) => {
     threads = data.threads;
     try {
       await init();
-      for (const group of sentenceGroups(await phonemizePieces("Hello there."))) await synth(group); // warm-up: the first phonemize and first run are slower
-      postMessage({ type: "ready" });
+      // Warm-up, so the first reply pays none of it: the first ONNX run is slower, and espeak costs
+      // 10-30 ms a call for its first ~28 calls before settling at about 3 ms.
+      for (const group of sentenceGroups(await phonemizePieces("Hello there."))) await synth(group);
+      for (let i = 0; i < 28; i++) await phonemize("warm up");
+      postMessage({ type: "ready", threads: ort.env.wasm.numThreads });
     }
     catch (e) { postMessage({ type: "error", message: "voice: " + (e.message || e) }); }
   } else if (data.type === "speak") {
@@ -238,6 +261,8 @@ const PREROLL_FRAMES = 10;
 const TAIL_FRAMES = 10;
 const VOICE_TIMEOUT_MS = 45000;
 const VOICE_GAIN = 2;
+// 4 threads is Paradee's measured peak here: 7.4x real time on 1, 10.1x on 2, 12.0x on 4, 10.1x on 8.
+const PARADEE_THREADS = Math.max(1, Math.min(4, navigator.hardwareConcurrency || 2));
 const API = "https://inference.baseten.co/v1/chat/completions";
 const SYSTEM = "You are on a live voice call. Answer in one to three short, plain spoken sentences. No markdown, lists, emojis, code or stage directions. Sound like a person talking.";
 
@@ -264,13 +289,19 @@ $("barge").checked = store.get("barge", "") === "1";
 $("barge").onchange = () => store.set("barge", $("barge").checked ? "1" : "");
 
 // ---------- the voices ----------
-// Paradee runs on the device. The rest are remote: Kyutai's Pocket TTS on your own Baseten
-// deployment (Baseten's library does not carry it), and Orpheus on Groq, which is the only
-// voice Groq hosts. `rate` is each one's own output rate and is only a hint: the real rate comes
-// from the wav header, and the AudioContext is built at it so nothing is ever resampled.
+// Two run on the device: Paradee, and Gradium's Phonon, which is three entries because where it
+// runs is worth choosing per machine (`cpu` is the measured-safe one, `webgpu` insists on the GPU,
+// `auto` takes the GPU only when the browser offers a hardware adapter). The rest are remote:
+// Kyutai's Pocket TTS on your own Baseten deployment (Baseten's library does not carry it), and
+// Orpheus on Groq, which is the only voice Groq hosts. `rate` is each one's own output rate and is
+// only a hint: the real rate comes from the wav header, and the AudioContext is built at it so
+// nothing is ever resampled.
 const PROVIDER_NAME = { baseten: "Baseten", groq: "Groq", openrouter: "OpenRouter" };
 const VOICES = {
-  paradee:        { label: "Paradee 8M · on device",     rate: 24000, local: true },
+  paradee:        { label: "Paradee 8M · on device",     rate: 24000, local: "paradee" },
+  phonon:         { label: "Phonon 31M · on device",     rate: 24000, local: "phonon", device: "cpu" },
+  phonon_auto:    { label: "Phonon 31M · auto device",   rate: 24000, local: "phonon", device: "auto" },
+  phonon_gpu:     { label: "Phonon 31M · WebGPU",        rate: 24000, local: "phonon", device: "webgpu" },
   pocket_18m:     { label: "Pocket TTS 18M · Baseten",   rate: 24000, provider: "baseten", model: "english_18m_2026-10" },
   pocket_7m:      { label: "Pocket TTS 7M · Baseten",    rate: 24000, provider: "baseten", model: "english_7m_2026-10" },
   pocket_7m_refl: { label: "Pocket TTS 7M rl · Baseten", rate: 24000, provider: "baseten", model: "english_7m_refl_2026-10" },
@@ -278,12 +309,20 @@ const VOICES = {
   orpheus:        { label: "Orpheus · Groq",             rate: 24000, provider: "groq", model: "canopylabs/orpheus-v1-english", voice: "autumn" },
 };
 const TTS_MAX_CHARS = 180; // Groq's Orpheus rejects input over 200 characters
+const PHONON_MAX_CHARS = 400; // Phonon has no limit and splits by sentence itself; this just bounds one call
+const PHONON_GAIN = 2; // its peaks measure 0.42-0.45, so this lands just under full scale
 
 let engine = store.get("engine", "paradee");
 if (!VOICES[engine]) engine = "paradee";
 const local = () => Boolean(VOICES[engine].local);
-// the on-device voice has to finish loading; a remote one only needs its key on the server
-const voiceReady = () => (local() ? ready.voice : Boolean(serverTts[VOICES[engine].provider]));
+// Paradee loads with the page, so it has to finish first. Phonon fetches its 69 MB checkpoint only
+// when picked, and can be asked to speak while that is still running. A remote voice needs nothing
+// but its key on the server.
+const voiceReady = () => {
+  const v = VOICES[engine];
+  if (v.local === "paradee") return ready.voice;
+  return v.local === "phonon" || Boolean(serverTts[v.provider]);
+};
 
 function buildEngines() {
   const sel = $("engine");
@@ -316,6 +355,7 @@ $("engine").onchange = () => {
   engine = $("engine").value;
   store.set("engine", engine);
   audioOut(); // rebuilt at the new rate before the first sentence, not during it
+  preloadEngine();
   readable();
 };
 
@@ -366,7 +406,7 @@ worker.onmessage = ({ data }) => {
 let voice, voiceTimer;
 // If the voice is not ready after VOICE_TIMEOUT_MS, retry on one thread: threaded onnxruntime fails
 // silently when its worker script is refused (for example a stale cached copy without the isolation headers).
-function startVoice(threads) {
+function startVoice(threads = PARADEE_THREADS) {
   voice?.terminate();
   voice = new Worker(blobUrl("voice", true));
   voice.onmessage = onVoice;
@@ -381,6 +421,7 @@ function startVoice(threads) {
 
 let playCtx = null, nextAt = 0, sources = [], speakId = 0, generated = false, seq = 0, speaking = false;
 let rq = { id: 0, buf: "", busy: false, done: false, abort: null }; // the remote voice's queue
+let pq = { id: 0, buf: "", busy: false, done: false, stream: null }; // Phonon's queue
 
 // Paradee outputs 24 kHz, and the remote voices have their own rates. A context at any other rate
 // makes Chrome resample every buffer with linear interpolation, which adds imaging distortion
@@ -401,10 +442,15 @@ function audioOut(rate = VOICES[engine].rate) {
 
 // Paradee is quiet (RMS about -26 dBFS, peaks 0.3-0.44). Boosting it lets the system volume stay lower,
 // which keeps the analog output stage's own hiss down; the cap keeps it from clipping.
-function play(samples) {
-  let peak = 0;
-  for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
-  const gain = Math.min(VOICE_GAIN, 0.95 / (peak || 1));
+// A streaming engine passes `fixed` instead: its chunks are 80 ms, and scaling each one by its own
+// peak would make the level pump between syllables.
+function play(samples, fixed) {
+  let gain = fixed;
+  if (gain === undefined) {
+    let peak = 0;
+    for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+    gain = Math.min(VOICE_GAIN, 0.95 / (peak || 1));
+  }
   for (let i = 0; i < samples.length; i++) samples[i] *= gain;
   const ctx = audioOut();
   const buf = ctx.createBuffer(1, samples.length, ctx.sampleRate);
@@ -431,6 +477,8 @@ function stopReading() {
   voice.postMessage({ type: "stop" }); // both are stopped, so a voice switch mid-sentence leaves nothing running
   rq.abort?.abort();
   rq = { id: 0, buf: "", busy: false, done: false, abort: null };
+  pq.stream?.cancel();
+  pq = { id: 0, buf: "", busy: false, done: false, stream: null };
   sources.forEach((s) => { s.onended = null; try { s.stop(); } catch {} });
   sources = [];
   nextAt = 0;
@@ -447,11 +495,19 @@ function finished() {
 }
 
 function onVoice({ data }) {
-  if (data.type === "ready") { ready.voice = true; clearTimeout(voiceTimer); readable(); }
+  if (data.type === "ready") {
+    ready.voice = true;
+    clearTimeout(voiceTimer);
+    // say what it got: threaded onnxruntime silently drops to one thread on a page that is not
+    // cross-origin isolated, which costs about 40% and is otherwise invisible
+    if (!$("meta").textContent) $("meta").textContent = `Paradee: fp32, ${data.threads} thread${data.threads === 1 ? "" : "s"}`;
+    readable();
+  }
   else if (data.type === "error") $("meta").textContent = data.message;
   else if (data.type === "audio" && data.id === speakId) play(data.samples);
   else if (data.type === "done" && data.id === speakId) { generated = true; if (!sources.length) finished(); }
 }
+if (!crossOriginIsolated) $("meta").textContent = "Not cross-origin isolated, so the voice gets one thread. Serve this page with COOP and COEP (server.mjs and _headers do).";
 startVoice();
 
 // ---------- the remote voices ----------
@@ -481,18 +537,18 @@ async function fetchVoice(text) {
 
 // One sentence per request, and the tail only once the text is complete, so audio starts before
 // the whole reply is written. A sentence over the provider's limit is cut at a word.
-function takePiece() {
-  const m = rq.buf.match(/^[\s\S]*?[.!?…](?=\s|$)/);
-  let piece = m ? m[0] : rq.done ? rq.buf : "";
+function takePiece(q, cap) {
+  const m = q.buf.match(/^[\s\S]*?[.!?…](?=\s|$)/);
+  let piece = m ? m[0] : q.done ? q.buf : "";
   if (!piece.trim()) return "";
-  let rest = rq.buf.slice(piece.length);
-  if (piece.length > TTS_MAX_CHARS) {
-    let cut = piece.lastIndexOf(" ", TTS_MAX_CHARS);
-    if (cut <= 0) cut = TTS_MAX_CHARS;
+  let rest = q.buf.slice(piece.length);
+  if (piece.length > cap) {
+    let cut = piece.lastIndexOf(" ", cap);
+    if (cut <= 0) cut = cap;
     rest = piece.slice(cut) + rest;
     piece = piece.slice(0, cut);
   }
-  rq.buf = rest.trim();
+  q.buf = rest.trim();
   return piece.trim();
 }
 
@@ -501,7 +557,7 @@ async function remotePump() {
   rq.busy = true;
   const id = rq.id;
   try {
-    for (let piece; (piece = takePiece()); ) {
+    for (let piece; (piece = takePiece(rq, TTS_MAX_CHARS)); ) {
       if (id !== speakId) break; // text that arrived while a request was in flight can out-run a stop
       rq.abort = new AbortController();
       const samples = await fetchVoice(piece);
@@ -522,10 +578,83 @@ function remoteSpeak(id, text, last) {
   remotePump();
 }
 
-// Paradee streams out of its worker; a remote voice is fetched a sentence at a time. Either way
-// the caller just hands over text as it arrives and marks the last piece.
+// ---------- Phonon, the other on-device voice ----------
+// The package starts its own worker, so this stays on the main thread and only shuttles chunks.
+// It yields 80 ms of audio at a time, which is why it reaches first sound in about 220 ms where a
+// one-shot vocoder has to finish a whole clause first. The checkpoint is 69 MB, so it is fetched
+// only once this voice is picked, and the Cache API keeps it after that. q8 is asked for because it
+// measured no slower than f32 in wasm and is the only format the package will put on WebGPU.
+let phonon = null; // { device, ready: Promise<PhononTTS> }
+
+function loadPhonon(device) {
+  if (phonon?.device !== device) {
+    phonon?.ready.then((tts) => tts.dispose(), () => {});
+    phonon = {
+      device,
+      ready: import("./lib/phonon/index.js")
+        .then(({ PhononTTS }) => PhononTTS.load({
+          lang: "en",
+          quant: "q8",
+          device,
+          threads: "auto",
+          onProgress: (p) => { if (p.total && !p.cached) $("meta").textContent = `Phonon ${p.file} ${Math.round((p.loaded / p.total) * 100)}%`; },
+        }))
+        .then((tts) => {
+          $("meta").textContent = `Phonon: ${tts.device}, ${tts.threads} thread${tts.threads === 1 ? "" : "s"}` +
+            (tts.device === "cpu" && device !== "cpu" ? ` (${tts.deviceReason})` : "");
+          return tts;
+        }),
+    };
+  }
+  return phonon.ready;
+}
+
+function phononFailed(e) {
+  $("meta").textContent = "Phonon: " + (e.message || e);
+  phonon = null; // a failed load must not be handed to the next request
+}
+
+// picking the voice is enough intent to start the download, so Read aloud is not the thing that waits
+function preloadEngine() {
+  if (VOICES[engine].local === "phonon") loadPhonon(VOICES[engine].device).catch(phononFailed);
+}
+
+async function phononPump() {
+  const q = pq;
+  if (q.busy) return;
+  q.busy = true;
+  try {
+    const tts = await loadPhonon(VOICES[engine].device);
+    for (let piece; (piece = takePiece(q, PHONON_MAX_CHARS)); ) {
+      if (q !== pq || q.id !== speakId) break; // text can out-run a stop or a voice switch
+      q.stream = tts.stream(piece);
+      for await (const chunk of q.stream) {
+        if (q !== pq || q.id !== speakId) break; // breaking the loop cancels the stream
+        play(chunk, PHONON_GAIN);
+      }
+      await q.stream.done.catch(() => {});
+      q.stream = null;
+    }
+    if (q.done && !q.buf.trim() && q === pq && q.id === speakId) { generated = true; if (!sources.length) finished(); }
+  } catch (e) {
+    if (e.name !== "AbortError") { phononFailed(e); stopReading(); }
+  }
+  q.busy = false;
+}
+
+function phononSpeak(id, text, last) {
+  if (id !== pq.id) { pq.stream?.cancel(); pq = { id, buf: "", busy: false, done: false, stream: null }; }
+  pq.buf = (pq.buf + " " + text).trim();
+  pq.done ||= last;
+  phononPump();
+}
+
+// Paradee streams out of its worker, Phonon out of its own, and a remote voice is fetched a sentence
+// at a time. Either way the caller just hands over text as it arrives and marks the last piece.
 function speak(id, text, last) {
-  if (local()) voice.postMessage({ type: "speak", id, text, last });
+  const kind = VOICES[engine].local;
+  if (kind === "paradee") voice.postMessage({ type: "speak", id, text, last });
+  else if (kind === "phonon") phononSpeak(id, text, last);
   else remoteSpeak(id, text, last);
 }
 
@@ -840,5 +969,6 @@ $("call_groq").onclick = () => start_call("groq");
 $("call_mercury").onclick = () => start_call("openrouter");
 
 buildEngines(); // the remote voices turn on when /api/config says their key is there
+preloadEngine();
 readable();
 </script>

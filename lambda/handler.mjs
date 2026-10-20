@@ -77,7 +77,8 @@ async function tts(event, stream) {
 
 async function file(rawPath, stream) {
   const rel = rawPath === "/" ? "index.html" : rawPath.slice(1);
-  if (!/^(index\.html|lib\/[\w.\-]+)$/.test(rel)) return reply(stream, 404, "not found");
+  // lib/ is nested up to six deep: lib/phonon/wasm-threads/snippets/<hash>/src/workerHelpers.js
+  if (!/^(index\.html|lib(?:\/[\w.\-]+){1,6})$/.test(rel) || rel.includes("..")) return reply(stream, 404, "not found");
   try {
     reply(stream, 200, await fs.readFile(path.join(ROOT, rel)), { "Content-Type": TYPES[path.extname(rel)] ?? "application/octet-stream", "Cache-Control": "no-cache" });
   } catch { reply(stream, 404, "not found"); }

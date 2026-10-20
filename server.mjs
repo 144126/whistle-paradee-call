@@ -111,7 +111,8 @@ async function tts(req, res) {
 
 async function file(req, url, res) {
   const rel = url === "/" ? "index.html" : decodeURIComponent(url.slice(1));
-  if (!/^(index\.html|lib\/[\w.\-]+)$/.test(rel)) return send(res, 404, "not found");
+  // lib/ is nested up to six deep: lib/phonon/wasm-threads/snippets/<hash>/src/workerHelpers.js
+  if (!/^(index\.html|lib(?:\/[\w.\-]+){1,6})$/.test(rel) || rel.includes("..")) return send(res, 404, "not found");
   try {
     const full = path.join(ROOT, rel);
     const st = await fs.stat(full);
