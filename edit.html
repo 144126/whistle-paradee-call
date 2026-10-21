@@ -32,6 +32,8 @@
     padding: 0 20px 0 28px; font-size: 14px; color: var(--muted); background: linear-gradient(var(--bg) 50%, transparent); }
   #file { margin: 0; display: flex; align-items: center; gap: 8px; min-width: 0; }
   #name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  #save_state { font-size: 12px; color: var(--muted); }
+  #save_state[data-bad] { color: var(--bad); }
   #dirty { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--orange); transform: scale(0); transition: transform 240ms var(--out); }
   body[data-dirty] #dirty { transform: scale(1); }
   nav { display: flex; gap: 2px; }
@@ -179,7 +181,7 @@
 </style>
 
 <header id="top">
-  <p id="file"><span id="name"></span><i id="dirty" title="not saved to the file"></i></p>
+  <p id="file"><span id="name"></span><i id="dirty" title="not saved to the file"></i><span id="save_state" role="status" aria-live="polite"></span></p>
   <nav><button id="open">open</button><button id="save">save</button><button id="copy" title="copy the entire markdown as plain text">copy</button><button id="open_settings">settings</button></nav>
 </header>
 
