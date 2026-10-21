@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>phonon</title>
+<link rel="icon" href="data:,">
+<link rel="modulepreload" href="lib/phonon-checkpoint.mjs">
+<link rel="modulepreload" href="lib/phonon-0.4.0/index.js">
+<link rel="modulepreload" href="lib/phonon-0.4.0/hub.js">
+<link rel="modulepreload" href="lib/phonon-0.4.0/fetch.js">
+<link rel="modulepreload" href="lib/phonon-0.4.0/wav.js">
+<style>
+  :root {
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --t12: 12px; --t14: 14px; --t16: 16px; --t20: 20px; --t30: 30px;
+    --s4: 4px; --s8: 8px; --s12: 12px; --s16: 16px; --s24: 24px; --s32: 32px; --s48: 48px;
+    --r8: 8px; --r12: 12px;
+    --fast: 150ms; --press: 200ms;
+    --bg: #ffffff; --surface: #f5f5f7; --text: #1d1d1f; --muted: #6e6e73;
+    --edge: #86868b; --accent: #1d1d1f; --on-accent: #ffffff; --ok: #1f7a3d; --warn: #995700; --bad: #c0261c;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --surface: #1c1c1e; --text: #f5f5f7; --muted: #a1a1a6;
+      --edge: #7c7c80; --accent: #f5f5f7; --on-accent: #000000; --ok: #32d74b; --warn: #ffb340; --bad: #ff6961;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: var(--t16)/1.5 var(--font); -webkit-font-smoothing: antialiased; }
+  main { max-width: 40rem; margin: 0 auto; padding: var(--s48) var(--s24); display: grid; gap: var(--s24); }
+  h1 { margin: 0; font-size: var(--t30); line-height: 1.2; letter-spacing: -0.02em; font-weight: 600; }
+  #status { display: flex; align-items: center; gap: var(--s8); min-height: 24px; font-size: var(--t14); color: var(--muted); font-variant-numeric: tabular-nums; }
+  #status svg { flex: none; width: 16px; height: 16px; }
+  #status[data-kind=loading] svg { color: var(--warn); }
+  #status[data-kind=ready] svg { color: var(--ok); }
+  #status[data-kind=error] { color: var(--bad); }
+  #status[data-kind=loading] .spin { transform-origin: center; animation: spin 900ms linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #bar { height: 4px; border-radius: 2px; background: var(--surface); overflow: hidden; }
+  #bar[hidden] { display: none; }
+  #bar i { display: block; height: 100%; width: 0; background: var(--text); transition: width var(--fast) linear; }
+  textarea { width: 100%; min-height: 9rem; resize: vertical; padding: var(--s16); border: 1px solid var(--edge); border-radius: var(--r12);
+    background: var(--surface); color: var(--text); font: var(--t16)/1.5 var(--font); }
+  textarea::placeholder { color: var(--muted); }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s16); }
+  button { min-height: 48px; min-width: 120px; padding: 0 var(--s24); border: 0; border-radius: 999px; background: var(--accent); color: var(--on-accent);
+    font: 600 var(--t16)/1 var(--font); cursor: pointer; transition: transform var(--press), opacity var(--fast); }
+  button:active:not(:disabled) { transform: scale(0.97); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  fieldset { display: inline-flex; margin: 0; padding: var(--s4); border: 0; border-radius: var(--r12); background: var(--surface); }
+  legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  fieldset label { display: grid; place-items: center; min-height: 40px; min-width: 64px; padding: 0 var(--s12); border-radius: var(--r8);
+    font-size: var(--t14); color: var(--muted); cursor: pointer; user-select: none; transition: background var(--fast), color var(--fast); }
+  fieldset input { position: absolute; opacity: 0; pointer-events: none; }
+  fieldset label:has(input:checked) { background: var(--bg); color: var(--text); font-weight: 600; }
+  fieldset:has(input:disabled) label { cursor: default; }
+  #stats { min-height: 21px; font-size: var(--t14); color: var(--muted); font-variant-numeric: tabular-nums; }
+  a { color: var(--text); font-size: var(--t14); text-decoration: underline; text-underline-offset: 3px; }
+  :focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+  fieldset label:has(input:focus-visible) { outline: 2px solid var(--text); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    #status[data-kind=loading] .spin { animation: none; }
+    button, #bar i, fieldset label { transition: none; }
+    button:active:not(:disabled) { transform: none; }
+  }
+</style>
+<main>
+  <h1>phonon</h1>
+  <div>
+    <p id="status" data-kind="loading" role="status" aria-live="polite"><span id="icon"></span><span id="label">loading</span></p>
+    <div id="bar" hidden><i></i></div>
+  </div>
+  <textarea id="text" placeholder="type something to hear it" aria-label="text to speak">this voice runs on your own machine. it loaded before you asked, so it answers the moment you do.</textarea>
+  <div class="row">
+    <button id="speak" disabled>speak</button>
+    <fieldset id="device">
+      <legend>where it runs</legend>
+      <label title="the processor, measured fastest and safest"><input type="radio" name="device" value="cpu">cpu</label>
+      <label title="the gpu when the browser offers a hardware one, else the processor"><input type="radio" name="device" value="auto">auto</label>
+      <label title="the gpu only; fails where there is none"><input type="radio" name="device" value="webgpu">webgpu</label>
+    </fieldset>
+  </div>
+  <p id="stats"></p>
+  <a href="./">back to whistle</a>
+</main>
+<script type="module">
+import { CHECKPOINT } from "./lib/phonon-checkpoint.mjs";
+
+const CACHE = "phonon-tts-v1"; // CACHE_NAME in lib/phonon-0.4.0/fetch.js: the package reads its files from here before the network
+const PART = 8 << 20; // a tab closed mid-download loses at most this much
+const GAIN = 2; // Phonon peaks at 0.42-0.45, so this lands just under full scale
+const LEAD = 0.03; // s of audio scheduled ahead of the clock, so the first chunk never starts late
+const HUB = `https://huggingface.co/${CHECKPOINT.repo}/resolve/${CHECKPOINT.commit}/`;
+const TOTAL = Object.values(CHECKPOINT.files).reduce((a, b) => a + b, 0);
+const ICONS = {
+  loading: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-opacity=".25" stroke-width="2"/><path class="spin" d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+  ready: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="currentColor"/><path d="M4.8 8.2l2.1 2.1 4.3-4.6" fill="none" style="stroke:var(--bg)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  error: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="currentColor"/><path d="M8 4.5v4.2M8 11.2v.3" style="stroke:var(--bg)" stroke-width="1.8" stroke-linecap="round"/></svg>',
+};
+
+const $ = (id) => document.getElementById(id);
+const saved = { get: (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
+const mb = (n) => (n / 1e6).toFixed(1);
+
+// Both start before anything else: the package's code, and where its files come from. server.mjs
+// says when it has the checkpoint on this machine's disk; everywhere else it is the Hub.
+const opened = performance.now();
+const lib = import("./lib/phonon-0.4.0/index.js");
+const base = fetch("/api/config").then((r) => (r.ok ? r.json() : {})).then(
+  (c) => (c.phonon ? new URL(c.phonon, location.href).href : HUB),
+  () => HUB,
+);
+
+let tts = null, running = null, readyText = "", device = saved.get("phonon-device", "cpu"), booting = null, stream = null, ctx = null, sources = [], persisted = false;
+if (!["cpu", "auto", "webgpu"].includes(device)) device = "cpu";
+document.querySelector(`input[value=${device}]`).checked = true;
+
+function status(kind, text) {
+  $("status").dataset.kind = kind;
+  $("status").ariaBusy = String(kind === "loading"); // progress changes ten times a second; announce where it settles
+  $("icon").innerHTML = ICONS[kind];
+  $("label").textContent = text;
+}
+
+// a failed device switch leaves the old model running, so once that failure has been seen, its
+// ready line goes back up rather than the page reading as broken until a reload
+function unstick() {
+  if ($("status").dataset.kind === "error" && readyText) status("ready", readyText);
+}
+
+function refresh() {
+  $("speak").disabled = !tts || Boolean(booting) || (!stream && !$("text").value.trim());
+  $("speak").textContent = stream ? "stop" : "speak";
+  for (const input of document.querySelectorAll("#device input")) input.disabled = Boolean(booting || stream);
+}
+
+// ---------- a first download from the Hub ----------
+// The page fills the package's cache itself (it keeps each file under its URL and looks there before
+// the network), so that a first download can resume and show its progress. Files from this
+// machine's own server are left to the package: it caches them after the load, off the critical
+// path, and a disk is fast enough that resuming would buy nothing.
+
+async function readBody(res, onBytes) {
+  const reader = res.body.getReader();
+  const chunks = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return new Blob(chunks);
+    chunks.push(value);
+    onBytes(value.length, true);
+  }
+}
+
+async function fetchOk(url, init) {
+  const res = await fetch(url, { cache: "no-store", ...init }); // kept in the Cache API; the HTTP cache keeping it too would store it twice
+  if (!res.ok) throw new Error(`${url.split("/").pop()} answered HTTP ${res.status}`);
+  return res;
+}
+
+// Sequential ranges, each cached under its own key until the whole file is in, so a closed tab
+// resumes where it stopped instead of starting the ~34 s again. Sequential because 8 parallel
+// ranges measured slower than one stream (1.72 against 2.03 MB/s): the line is the limit, not the
+// connection. Cache.put refuses a 206, hence each part's fresh Response.
+async function fetchParts(cache, url, size, onBytes) {
+  const parts = [];
+  for (let at = 0; at < size; at += PART) {
+    const end = Math.min(at + PART, size) - 1;
+    let part = await cache.match(`${url}?part=${at}`).then((r) => r?.blob(), () => undefined);
+    if (part?.size === end - at + 1) onBytes(part.size, false);
+    else {
+      const res = await fetchOk(url, { headers: { Range: `bytes=${at}-${end}` } }).catch((e) => {
+        if (at) throw e;
+        return fetchOk(url); // the range itself was refused: one stream, not resumable
+      });
+      if (res.status === 200 && at === 0) return cache.put(url, new Response(await readBody(res, onBytes))); // ranges ignored: this is the whole file
+      if (res.status !== 206) throw new Error(`bytes ${at}-${end} answered HTTP ${res.status}`);
+      part = await readBody(res, onBytes);
+      if (part.size !== end - at + 1) throw new Error(`bytes ${at}-${end} arrived as ${part.size}`);
+      await cache.put(`${url}?part=${at}`, new Response(part));
+    }
+    parts.push(part);
+  }
+  status("loading", "saving"); // one more write of the whole file: seconds on a slow disk
+  await cache.put(url, new Response(new Blob(parts), { headers: { "content-length": String(size) } }));
+  await Promise.all(parts.map((_, i) => cache.delete(`${url}?part=${i * PART}`)));
+}
+
+// The small files go alongside the weights rather than before them: each costs a redirect and a
+// fresh connection from here (about 1.3 s to a first byte), which in a row came to seconds of nothing.
+async function cacheFromHub(from, onBytes) {
+  const cache = typeof caches === "undefined" ? null : await caches.open(CACHE).catch(() => null);
+  if (!cache) return; // no Cache API here (insecure context, blocked storage): the package downloads on its own
+  const files = Object.entries(CHECKPOINT.files);
+  const hits = await Promise.all(files.map(([name]) => cache.match(from + name).catch(() => undefined)));
+  if (hits.some((hit) => !hit)) status("loading", `downloading ${mb(TOTAL)} MB`);
+  await Promise.all(files.map(async ([name, size], i) => {
+    if (hits[i]) return onBytes(size, false);
+    if (size > PART) return fetchParts(cache, from + name, size, onBytes);
+    await cache.put(from + name, new Response(await readBody(await fetchOk(from + name), onBytes)));
+  }));
+}
+
+// ---------- loading the model ----------
+
+async function boot(since) {
+  status("loading", "loading");
+  refresh();
+  const from = await base;
+  const sourced = performance.now();
+  let done = 0, fetched = 0, firstByte = 0, shown = 0, copied = false;
+  const marks = []; // [time, bytes fetched] over the last 10 s: steady against a line that swings 0.7-2.3 MB/s, past the connection's ramp-up
+  const onBytes = (n, network) => {
+    done += n;
+    if (network) { fetched += n; firstByte ||= performance.now(); }
+    const now = performance.now();
+    if (!fetched || (now - shown < 100 && done < TOTAL)) return;
+    shown = now;
+    marks.push([now, fetched]);
+    while (now - marks[0][0] > 10000) marks.shift();
+    $("bar").hidden = false;
+    $("bar").firstElementChild.style.width = `${(done / TOTAL) * 100}%`;
+    const rate = (fetched - marks[0][1]) / ((now - marks[0][0]) / 1000);
+    status("loading", `${mb(done)} of ${mb(TOTAL)} MB` + (now - firstByte >= 3000 && rate > 0 ? ` · ${mb(rate)} MB/s · ${Math.ceil((TOTAL - done) / rate)} s left` : ""));
+  };
+  if (!from.startsWith(location.origin)) {
+    try {
+      await cacheFromHub(from, onBytes);
+    } catch (e) {
+      $("bar").hidden = true;
+      status("error", `the download stopped at ${mb(done)} MB (${e.message}). reload to pick up where it stopped.`);
+      return;
+    }
+  }
+  $("bar").hidden = true;
+  const cached = performance.now();
+  if (fetched) status("loading", "starting");
+  try {
+    const { PhononTTS } = await lib;
+    const next = await PhononTTS.load({
+      lang: "en",
+      quant: "q8", // the only format the package puts on WebGPU, and measured no slower than f32 in wasm
+      device,
+      model: {
+        weights: { q8: from + "model.q8.gguf" },
+        tokenizer: from + "tokenizer.json",
+        config: from + "config.json",
+        voices: { default: from + "default-voice.safetensors" },
+        defaultVoice: "default",
+      },
+      onProgress: (p) => {
+        if (p.cached || !p.total) return;
+        copied = true;
+        if (p.loaded < p.total) status("loading", `copying ${p.file} from this disk ${Math.round((p.loaded / p.total) * 100)}%`);
+        else if (p.file === "weights" || p.file.startsWith("voice:")) status("loading", "starting"); // the small files finish while the weights still copy
+      },
+    });
+    tts?.dispose(); // only now: a device that fails to start leaves the working one in place
+    tts = next;
+    running = device;
+  } catch (e) {
+    if (!running) return status("error", `${device} did not start: ${e.message}. pick cpu.`);
+    status("error", `${device} did not start: ${e.message}. back to ${running}${tts.device === running ? "" : `, on ${tts.device}`}.`);
+    device = running;
+    saved.set("phonon-device", device);
+    document.querySelector(`input[value=${device}]`).checked = true;
+    return;
+  }
+  const ready = performance.now();
+  const where = fetched ? "downloaded" : copied ? "copied from this disk" : "cache";
+  const fell = tts.device !== device ? ` (${tts.deviceReason})` : "";
+  readyText = `ready in ${((ready - since) / 1000).toFixed(2)} s · ${where} · ${tts.device}${fell} · ${tts.threads} thread${tts.threads === 1 ? "" : "s"}`;
+  status("ready", readyText);
+  console.log(`[phonon] ready in ${Math.round(ready - since)} ms: source ${Math.round(sourced - since)}, hub download ${Math.round(cached - sourced)}, model load ${Math.round(ready - cached)}`);
+  if (!persisted) {
+    persisted = true; // asked once: Chrome decides from how much the site is used, without a prompt
+    navigator.storage?.persist?.().then((ok) => console.log(`[phonon] storage ${ok ? "kept" : "evictable"}: ${mb(TOTAL)} MB checkpoint`));
+  }
+}
+
+function load(since) {
+  booting = boot(since).finally(() => { booting = null; refresh(); });
+}
+
+// ---------- speaking ----------
+
+function stop() {
+  stream?.cancel();
+  stream = null;
+  for (const s of sources) { s.onended = null; try { s.stop(); } catch {} }
+  sources = [];
+  refresh();
+}
+
+async function speak() {
+  const text = $("text").value.trim();
+  if (!text || !tts) return;
+  unstick();
+  ctx ??= new AudioContext({ sampleRate: tts.sampleRate, latencyHint: "interactive" });
+  await ctx.resume();
+  const clicked = performance.now();
+  let mine = null, first = 0, at = 0, audio = 0, generated = false;
+  const settle = () => { if (generated && !sources.length && stream === mine) stop(); };
+  $("stats").textContent = "";
+  try {
+    mine = stream = tts.stream(text);
+    refresh();
+    for await (const pcm of mine) {
+      if (stream !== mine) break; // breaking the loop cancels the stream
+      if (!first) {
+        first = performance.now() - clicked;
+        at = ctx.currentTime + LEAD;
+        $("stats").textContent = `first sound ${Math.round(first + LEAD * 1000)} ms`;
+      }
+      for (let i = 0; i < pcm.length; i++) pcm[i] *= GAIN;
+      const buf = ctx.createBuffer(1, pcm.length, ctx.sampleRate);
+      buf.copyToChannel(pcm, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.onended = () => { sources = sources.filter((x) => x !== src); settle(); };
+      at = Math.max(at, ctx.currentTime + 0.005); // generation fell behind: start now rather than in the past
+      src.start(at);
+      at += buf.duration;
+      audio += buf.duration;
+      sources.push(src);
+    }
+    const stats = await mine.done;
+    if (stream !== mine) return; // stopped: the first-sound figure stays up
+    const gen = stats.totalMs / 1000;
+    $("stats").textContent = `first sound ${Math.round(first + LEAD * 1000)} ms · ${audio.toFixed(1)} s of speech in ${gen.toFixed(1)} s · ${(audio / gen).toFixed(1)}x real time`;
+    generated = true;
+    settle();
+  } catch (e) {
+    if (mine && stream !== mine) return;
+    status("error", `speaking failed: ${e.message}. reload to start the voice again.`);
+    stop();
+  }
+}
+
+$("speak").onclick = () => (stream ? stop() : speak());
+$("text").oninput = refresh;
+$("text").onkeydown = (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (!$("speak").disabled) $("speak").click(); } };
+$("device").onclick = (e) => { if (e.target.value === running) unstick(); }; // re-picking the running device changes nothing, so no change event
+$("device").onchange = (e) => {
+  device = e.target.value;
+  saved.set("phonon-device", device);
+  load(performance.now());
+};
+
+load(opened);
+</script>
+</html>

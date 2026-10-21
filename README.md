@@ -95,11 +95,11 @@ printf %s "$GROQ_API_KEY"    | pnpm dlx wrangler pages secret put GROQ_API_KEY -
 printf %s "$WHISTLE_OPENROUTER_KEY" | pnpm dlx wrangler pages secret put WHISTLE_OPENROUTER_KEY --project-name whistle
 printf %s "$BASETEN_TTS_URL" | pnpm dlx wrangler pages secret put BASETEN_TTS_URL --project-name whistle  # Pocket TTS voices
 
-rm -rf dist && mkdir dist && cp index.html _headers dist/ && cp -r lib dist/
+rm -rf dist && mkdir dist && cp index.html phonon.html _headers dist/ && cp -r lib dist/
 pnpm dlx wrangler pages deploy dist --project-name whistle --branch main
 ```
 
-`dist/` holds only the page, `_headers` (the isolation headers) and `lib/`. The functions are picked up from
+`dist/` holds only the two pages, `_headers` (the isolation headers, and a year's caching for `lib/phonon-0.4.0/`) and `lib/`. The functions are picked up from
 `functions/` next to it, so `server.mjs`, `lambda/` and this README are not uploaded. Redeploy with the last
 command after any change.
 
@@ -118,8 +118,8 @@ not been deployed to a real AWS account**, so expect to adjust the IAM/URL steps
 Needs the AWS CLI configured, and `zip`.
 
 ```bash
-# 1. package: the handler must sit next to index.html and lib/
-mkdir -p dist && cp lambda/handler.mjs index.html dist/ && cp -r lib dist/
+# 1. package: the handler must sit next to index.html, phonon.html and lib/
+mkdir -p dist && cp lambda/handler.mjs index.html phonon.html dist/ && cp -r lib dist/
 (cd dist && zip -qr ../whistle.zip .)
 
 # 2. role (once)
@@ -365,88 +365,65 @@ build next to Paradee (`onnxruntime-web` is already vendored in `lib/`; Kyutai s
 feasible but ship no official build) is still the interesting direction, but on these numbers it
 would roughly match the voice already there rather than beat it. Not done here.
 
-### Phonon's load, and why it cannot be made fast
+### The Phonon page
 
-Phonon's first load measured 60.5 s (f32) and 96.7 s (q8) here. Both numbers are worth taking apart,
-because the obvious reading of them is wrong twice over.
+`phonon.html` (http://localhost:8123/phonon.html, and `/phonon.html` on any deployment) is Phonon on
+its own, built to load as fast as it can. The model gets no faster. What goes is every part of the load
+that was redone each time, or done only once you asked.
 
-**The 96.7 s was mostly not loading.** q8 is 69.5 MB and f32 is 107.8 MB, so the *bigger* download
-finished 36 s sooner. At the link speed below, f32's 60.5 s is almost exactly right and q8 should
-have taken 36 s; the other ~60 s was a machine with 265 MB free and 11.7 GB of swap in use. Any
-figure measured under that is a figure about swap.
+Where a warm load went before, phase by phase (fresh Chromium, cross-origin isolated, 3 threads, q8,
+everything cached, median of 5):
 
-**The link is the wall, not the Hub.** Measured for the same 8 MB:
+| phase | ms | share |
+|---|---|---|
+| Hugging Face API lookup, done on every load even for a pinned commit | 519 | 44% |
+| default-voice prefill (`add_voice` runs the voice through the 6-layer transformer) | 295 | 25% |
+| `Model.load` | 152 | 13% |
+| reading the 64.5 MB of weights from the Cache API | 73 | 6% |
+| worker start, glue import, wasm compile (from V8's cache), thread pool | ~90 | 8% |
+| **page wall** | **1169** | |
 
-| source | throughput |
+What the page does about it:
+
+- **No Hub lookup.** It hands the package a ModelSpec pinned file by file instead of `hf://...`. The
+  commit and each file's exact size live in `lib/phonon-checkpoint.mjs`, which the page and `server.mjs`
+  share. That alone took the measured load from 1169 to 636 ms.
+- **Loaded when the page opens**, not when asked. The voice prefill and `Model.load` stay in the load;
+  they are over before anyone has typed a sentence.
+- **A first download that resumes.** The page puts the checkpoint into the package's own cache
+  (`phonon-tts-v1`, which the package reads before the network) itself, in sequential 8 MB ranges kept
+  under their own keys, so a tab closed at 30 of 65 MB picks up at 30. Sequential because 8 parallel
+  ranges measured slower than one stream (1.72 against 2.03 MB/s): the line is the limit, not the
+  connection. A browser or server that refuses the range falls back to one stream. Then
+  `navigator.storage.persist()`, so Chrome does not evict 65 MB under disk pressure.
+- **This machine's disk before the network.** `server.mjs` serves the checkpoint same-origin from the
+  Hugging Face cache (`$HF_HOME/hub/models--gradium--phonon-31m-en/snapshots/<commit>/`) when every file
+  is there at its pinned size, and `/api/config` returns its path; anywhere else the page uses the Hub.
+  Here that turns a 35-97 s first load into a disk read.
+- **Package files cached for a year.** The vendored package is in `lib/phonon-0.4.0/`, a directory named
+  for its version, served `Cache-Control: public, max-age=31536000, immutable` by `server.mjs`,
+  `lambda/handler.mjs` and `_headers`, so a load revalidates none of its module and wasm files. An update
+  goes in a new directory (and the `_headers` line moves with it); nothing is ever changed in place.
+
+Measured on the page on this laptop (headless Chrome, the box at ~600-800 MB of free memory):
+
+| load | ready in |
 |---|---|
-| huggingface.co | 1.59 MB/s |
-| Cloudflare edge (`speed.cloudflare.com`) | 1.92 MB/s |
-| jsdelivr | 1.09 MB/s |
-| huggingface.co, 8 parallel ranges | 1.01 MB/s aggregate |
+| warm, browser already open (3 reloads) | 0.88-1.89 s |
+| warm, fresh browser process (5 launches) | 1.17-25.74 s, all of it inside the package's own model load |
+| first load, copied from this disk | 6.78 s |
+| first load from the Hub | 40.8 s, 39.1 of them the download at 0.7-2.3 MB/s; a tab closed at 20.4 MB resumed at 17.3 |
 
-Parallel is *slower* than one stream, which is what a saturated line looks like. So 64.5 MB takes
-about 34 s whoever serves it, and moving the weights to a CDN, to S3, or to the page's own origin
-buys at most 1.2x. It is still worth doing for the other reasons below, just not for throughput.
+The page logs where each load went: `[phonon] ready in N ms: source, hub download, model load`. The spread
+in fresh processes is this machine swapping, not the page: the cache read is 13-66 ms in every run, and the
+same load measured 0.64 s phase by phase with more memory free. After that, speech starts 150-250 ms after
+pressing speak, most of it the model reading the sentence before its first frame.
 
-**The bytes are nearly irreducible.** Parsing the GGUF tensor tables of both quantizations (185
-tensors, 41.10M params):
-
-| module | tensors | q8 size | note |
-|---|---|---|---|
-| `flow_lm.transformer` | 48 | 20.08 MB | the only quantized part, Q8_0 |
-| `flow_lm.flow_net` | 68 | 18.99 MB | BF16, untouched by `--quant` |
-| `mimi.decoder_transformer` | 20 | 12.60 MB | BF16 |
-| `mimi.decoder` | 22 | 7.95 MB | BF16 convolutions |
-| `flow_lm.condition_provider` | 9 | 4.77 MB | BF16 |
-| everything else | 18 | 0.09 MB | |
-
-`--quant` only ever touches **24 tensors**: Q8_0 20.05 MB, or Q4_K 10.62 MB in `model.q4k.gguf`.
-The other 161 stay BF16 at 44.44 MB, which is 69% of the q8 download and 81% of q4k. So q4k is only
-55.1 MB against 64.5 MB, and a hypothetical build that quantized every linear would land near 29 MB.
-There is also no `mimi.encoder.*` in this checkpoint (it was built with `quantize --no-mimi-encoder`,
-which the wasm's own error string names), so there is nothing dead to strip — and cloning a voice
-from a recording needs that encoder, so this checkpoint only takes precomputed voice embeddings.
-
-**q4k will not load in the browser.** The wasm carries type names for q4_0, q4_1, q5_0, q5_1, q6k,
-q8_0, q8_1 and q8k, and no q4_k, next to an `unsupported quantization '` error string. Pointing the
-`q8` slot at `model.q4k.gguf` would therefore download 55 MB and then fail. Not attempted.
-
-Put together: a 100x faster load would need 1.9 MB on the wire, and the floor is 29 MB even in a
-build that does not exist. **That is not reachable.** What is reachable is never waiting for it:
-
-- **Pinned `ModelSpec` instead of `hf://...`** — the package's Hub API lookup costs 0.52 s on every
-  load, and `index.html` now names every file at a fixed commit instead. The URLs it builds are byte
-  for byte the ones the Hub lookup produced, so anything already cached still hits.
-- **`PHONON_BASE`, one constant** — on an S3 or CloudFront static site, point it at the bucket and
-  the checkpoint comes from the page's own origin. S3 has no per-file cap; Cloudflare Pages refuses
-  any asset over 25 MiB, so the 64.5 MB GGUF cannot live there.
-- **Idle prefetch** — once Paradee is up and the page is quiet, `prefetchPhonon()` fills the
-  package's own cache (`phonon-tts-v1`) with the checkpoint *without starting the model*, so nothing
-  is resident until the voice is actually picked. `PHONON_PREFETCH = false` turns it off, and it
-  skips itself on `saveData` or a 2g connection.
-- **Resumable in 8 MB ranges** — each range is cached under its own key and assembled at the end, so
-  a tab closed mid-download resumes instead of starting the 34 s again. `Cache.put` refuses a 206,
-  hence the rebuilt `Response`. A server that refuses ranges, or a browser that will not send the
-  header cross-origin, falls back to one stream. `huggingface.co` answers an `OPTIONS` preflight with
-  `access-control-allow-headers: range` and exposes `Content-Range`, and LFS redirects to
-  `us.aws.cdn.hf.co`, which both get a `preconnect`.
-- **Kept alive** — the worker is disposed only when the device changes, so switching to another voice
-  and back costs nothing. It measured 605 MB resident, which is the reason it is not loaded eagerly.
-
-The warm path is already well built and is not where the remaining time is: the package streams into
-one preallocated buffer, caches from a clone rather than re-serialising, and `instantiateStreaming`
-does reach Chrome's code cache because the server sends `application/wasm`. What is left of its
-3.13 s is the 64.5 MB Cache API read and the Rust-side GGUF parse. OPFS with
-`createSyncAccessHandle` in the worker would beat the Cache API at that size, and pre-sizing the
-shared heap would avoid repeated `memory.grow` over ~100 MB. Neither is done here.
-
-**On an AWS static site** (S3 behind CloudFront), two things matter beyond the above. Threads need
-the page cross-origin isolated, so CloudFront must attach a response-headers policy sending
-`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` — without
-it `onnxruntime-web` and Phonon both silently drop to one thread, which costs about 40% and shows up
-nowhere. `#meta` now prints the thread count each engine actually got, and the page says so outright
-when `crossOriginIsolated` is false. And `.wasm` must be served as `application/wasm`, or
-`instantiateStreaming` falls back to the slower non-streaming path.
+Why the rest cannot go: a first download over a ~2 MB/s line is 65 MB / 2 MB/s whoever serves it, and
+the file cannot shrink much, because 44.44 MB of it (69%, all of Mimi and part of flow_lm) is BF16 that
+`q8` never touched. A voice stored as its KV cache would skip the 295 ms prefill (the wasm build reads
+one with "Nothing to run"), but no Phonon voice is published that way, and it would be ~3 MB in place
+of 256 KB.
 
 ### Orpheus on Groq
 

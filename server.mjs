@@ -3,12 +3,17 @@
 // WHISTLE_OPENROUTER_KEY), so a key never reaches the browser or the code.
 // /api/tts does the same for remote voices: Pocket TTS on your own Baseten deployment
 // (BASETEN_TTS_URL) and Orpheus on Groq. The on-device voice needs neither.
+// It also serves the Phonon checkpoint same-origin from this machine's Hugging Face cache, when a
+// complete copy is there, so the Phonon page's first load reads the disk instead of the network.
 // Run: node server.mjs   (PORT=8123 by default, bound to 127.0.0.1 only)
 import http from "node:http";
 import fs from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Readable, pipeline } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { CHECKPOINT } from "./lib/phonon-checkpoint.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 // keys from ./.env (gitignored) when the shell does not set them
@@ -38,6 +43,18 @@ const HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`]);
 const ORIGINS = new Set([`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`]);
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".json": "application/json" };
 const FIELDS = ["model", "messages", "stream", "max_tokens", "temperature", "reasoning_effort"];
+// A directory named for its version (lib/phonon-0.4.0/) never changes in place, so it is cached for
+// a year without revalidating; a new version is a new directory. Everything else revalidates.
+const VERSIONED = /^lib\/[\w.]+-\d+\.\d+\.\d+\//;
+const IMMUTABLE = "public, max-age=31536000, immutable";
+
+// Phonon's checkpoint, where huggingface_hub keeps it. Offered to the page only when every file is
+// there at its pinned size, so a partial or different copy is never served.
+const PHONON_DIR = path.join(process.env.HF_HOME || path.join(os.homedir(), ".cache", "huggingface"), "hub",
+  `models--${CHECKPOINT.repo.replace("/", "--")}`, "snapshots", CHECKPOINT.commit);
+const PHONON_PATH = `/models/${CHECKPOINT.repo}@${CHECKPOINT.commit}/`;
+const phononLocal = (await Promise.all(Object.entries(CHECKPOINT.files).map(([name, size]) =>
+  fs.stat(path.join(PHONON_DIR, name)).then((st) => st.size === size, () => false)))).every(Boolean);
 
 // cross-origin isolation lets onnxruntime-web use several threads
 const ISOLATE = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp" };
@@ -111,18 +128,26 @@ async function tts(req, res) {
 
 async function file(req, url, res) {
   const rel = url === "/" ? "index.html" : decodeURIComponent(url.slice(1));
-  // lib/ is nested up to six deep: lib/phonon/wasm-threads/snippets/<hash>/src/workerHelpers.js
-  if (!/^(index\.html|lib(?:\/[\w.\-]+){1,6})$/.test(rel) || rel.includes("..")) return send(res, 404, "not found");
+  // lib/ is nested up to six deep: lib/phonon-0.4.0/wasm-threads/snippets/<hash>/src/workerHelpers.js
+  if (!/^(index\.html|phonon\.html|lib(?:\/[\w.\-]+){1,6})$/.test(rel) || rel.includes("..")) return send(res, 404, "not found");
   try {
     const full = path.join(ROOT, rel);
     const st = await fs.stat(full);
     // always revalidate: a cached copy from before a header change must never be reused
     const etag = `"${st.size}-${Math.round(st.mtimeMs)}"`;
-    const headers = { "Content-Type": TYPES[path.extname(rel)] ?? "application/octet-stream", "Cache-Control": "no-cache", ETag: etag, ...ISOLATE };
+    const headers = { "Content-Type": TYPES[path.extname(rel)] ?? "application/octet-stream", "Cache-Control": VERSIONED.test(rel) ? IMMUTABLE : "no-cache", ETag: etag, ...ISOLATE };
     if (req.headers["if-none-match"] === etag) { res.writeHead(304, headers); return res.end(); }
     res.writeHead(200, headers);
     res.end(await fs.readFile(full));
   } catch { send(res, 404, "not found"); }
+}
+
+// Streamed rather than read whole: the weights are 64.5 MB. no-store because the page keeps them in
+// the Cache API, and the HTTP cache keeping them as well would hold a second copy.
+function phononFile(name, res) {
+  if (!phononLocal || !Object.hasOwn(CHECKPOINT.files, name)) return send(res, 404, "not found");
+  res.writeHead(200, { "Content-Type": TYPES[path.extname(name)] ?? "application/octet-stream", "Content-Length": CHECKPOINT.files[name], "Cache-Control": "no-store", ...ISOLATE });
+  pipeline(createReadStream(path.join(PHONON_DIR, name)), res, () => {});
 }
 
 http.createServer((req, res) => {
@@ -130,13 +155,16 @@ http.createServer((req, res) => {
   const url = req.url.split("?")[0];
   if (req.method === "POST" && url === "/api/chat") return chat(req, res);
   if (req.method === "POST" && url === "/api/tts") return tts(req, res);
+  if (req.method === "GET" && url.startsWith(PHONON_PATH)) return phononFile(decodeURIComponent(url.slice(PHONON_PATH.length)), res);
   if (req.method === "GET" && url === "/api/config") return send(res, 200, JSON.stringify({
     key: Boolean(PROVIDERS.baseten.key),
     providers: Object.fromEntries(Object.entries(PROVIDERS).map(([k, p]) => [k, Boolean(p.key)])),
     tts: Object.fromEntries(Object.entries(VOICES).map(([k, v]) => [k, Boolean(v.key && v.url)])),
+    phonon: phononLocal ? PHONON_PATH : null,
   }), "application/json");
   if (req.method === "GET") return file(req, url, res);
   send(res, 405, "method not allowed");
 }).listen(PORT, "127.0.0.1", () => console.log(
   `http://localhost:${PORT}  (${Object.entries(PROVIDERS).map(([k, p]) => `${k} key ${p.key ? "found" : "NOT set"}`).join(", ")}` +
-  `; voices: ${Object.entries(VOICES).map(([k, v]) => `${k} ${v.key && v.url ? "ready" : v.key ? "no endpoint" : "no key"}`).join(", ")})`));
+  `; voices: ${Object.entries(VOICES).map(([k, v]) => `${k} ${v.key && v.url ? "ready" : v.key ? "no endpoint" : "no key"}`).join(", ")}` +
+  `; phonon checkpoint: ${phononLocal ? "served from " + PHONON_DIR : "from the Hub (no complete local copy)"})`));

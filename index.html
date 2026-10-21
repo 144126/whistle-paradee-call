@@ -3,8 +3,6 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Whistle</title>
 <link rel="icon" href="data:,">
-<link rel="preconnect" href="https://huggingface.co" crossorigin>
-<link rel="preconnect" href="https://us.aws.cdn.hf.co" crossorigin>
 <style>
   body { font: 18px system-ui; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
   button { font: inherit; padding: .8rem 1.4rem; border-radius: 2rem; border: 1px solid; cursor: pointer; }
@@ -336,26 +334,6 @@ const VOICES = {
 const TTS_MAX_CHARS = 180; // Groq's Orpheus rejects input over 200 characters
 const PHONON_MAX_CHARS = 400; // Phonon has no limit and splits by sentence itself; this just bounds one call
 const PHONON_GAIN = 2; // its peaks measure 0.42-0.45, so this lands just under full scale
-// Phonon's checkpoint, pinned to a commit and named file by file. A ModelSpec instead of
-// `hf://gradium/phonon-31m-en@<sha>` skips the Hub API lookup the package makes on every load
-// (measured 0.52 s) and makes the host one constant: on an S3 or CloudFront static site point
-// PHONON_BASE at the bucket and the weights come from the same origin as the page. S3 has no
-// per-file size cap, unlike Cloudflare Pages, which refuses any asset over 25 MiB.
-// These URLs are byte for byte the ones the package would have built, so anything already cached
-// from a Hub-resolved load still hits.
-const PHONON_BASE = "https://huggingface.co/gradium/phonon-31m-en/resolve/8c64b55ec301728e2d1695bfea87a08a267d0c2d/";
-const PHONON_WEIGHTS = PHONON_BASE + "model.q8.gguf";
-const PHONON_MODEL = {
-  weights: { q8: PHONON_WEIGHTS },
-  tokenizer: PHONON_BASE + "tokenizer.json",
-  config: PHONON_BASE + "config.json",
-  voices: { default: PHONON_BASE + "default-voice.safetensors" },
-  defaultVoice: "default",
-};
-const PHONON_FILES = [PHONON_MODEL.config, PHONON_MODEL.tokenizer, PHONON_MODEL.voices.default, PHONON_WEIGHTS];
-const PHONON_CACHE = "phonon-tts-v1"; // CACHE_NAME in lib/phonon/fetch.js: looked in before the network
-const PHONON_CHUNK = 8 << 20; // 8 MB a range. Sequential: 8 parallel ranges measured 1.01 MB/s against 1.59 for one
-const PHONON_PREFETCH = true; // false stops the 64.5 MB download happening before anyone asks for it
 
 let engine = store.get("engine", "paradee");
 if (!VOICES[engine]) engine = "paradee";
@@ -546,7 +524,6 @@ function onVoice({ data }) {
     // say what it got: threaded onnxruntime silently drops to one thread on a page that is not
     // cross-origin isolated, which costs about 40% and is otherwise invisible
     if (!$("meta").textContent) $("meta").textContent = `Paradee: fp32, ${data.threads} thread${data.threads === 1 ? "" : "s"}`;
-    if (VOICES[engine].local !== "phonon") (window.requestIdleCallback ?? ((f) => setTimeout(f, 3000)))(() => prefetchPhonon());
     readable();
   }
   else if (data.type === "error") $("meta").textContent = data.message;
@@ -637,27 +614,19 @@ function loadPhonon(device) {
     phonon?.ready.then((tts) => tts.dispose(), () => {});
     phonon = {
       device,
-      ready: (async () => {
-        const t0 = performance.now();
-        let downloaded = false;
-        const { PhononTTS } = await import("./lib/phonon/index.js");
-        const tts = await PhononTTS.load({
+      ready: import("./lib/phonon-0.4.0/index.js")
+        .then(({ PhononTTS }) => PhononTTS.load({
           lang: "en",
-          quant: "q8", // the only format the package will put on WebGPU, and no slower than f32 in wasm
-          model: PHONON_MODEL,
+          quant: "q8",
           device,
           threads: "auto",
-          onProgress: (p) => {
-            if (p.cached || !p.total) return;
-            downloaded = true;
-            $("meta").textContent = `Phonon ${p.file} ${Math.round((p.loaded / p.total) * 100)}%`;
-          },
-        });
-        $("meta").textContent = `Phonon: ${tts.device}, ${tts.threads} thread${tts.threads === 1 ? "" : "s"}, ` +
-          `${((performance.now() - t0) / 1000).toFixed(1)} s ${downloaded ? "downloaded" : "from cache"}` +
-          (tts.device === "cpu" && device !== "cpu" ? ` (${tts.deviceReason})` : "");
-        return tts;
-      })(),
+          onProgress: (p) => { if (p.total && !p.cached) $("meta").textContent = `Phonon ${p.file} ${Math.round((p.loaded / p.total) * 100)}%`; },
+        }))
+        .then((tts) => {
+          $("meta").textContent = `Phonon: ${tts.device}, ${tts.threads} thread${tts.threads === 1 ? "" : "s"}` +
+            (tts.device === "cpu" && device !== "cpu" ? ` (${tts.deviceReason})` : "");
+          return tts;
+        }),
     };
   }
   return phonon.ready;
@@ -671,54 +640,6 @@ function phononFailed(e) {
 // picking the voice is enough intent to start the download, so Read aloud is not the thing that waits
 function preloadEngine() {
   if (VOICES[engine].local === "phonon") loadPhonon(VOICES[engine].device).catch(phononFailed);
-}
-
-// Warms the package's own cache with the checkpoint without starting the model, so picking this
-// voice later costs no download and nothing is resident until it is actually wanted. Worth doing
-// because the download cannot be made fast: measured 1.59 MB/s from the Hub, 1.92 from
-// Cloudflare's edge, 1.09 from jsdelivr, and 1.01 across 8 parallel ranges, which is one saturated
-// ~15 Mbit line. 64.5 MB over it is 34 s whoever serves it, so the only way to make the wait
-// disappear is to have already waited.
-async function prefetchPhonon() {
-  if (!PHONON_PREFETCH || typeof caches === "undefined") return;
-  const conn = navigator.connection;
-  if (conn?.saveData || /2g$/.test(conn?.effectiveType ?? "")) return; // not on someone's phone data
-  const store = await caches.open(PHONON_CACHE).catch(() => null);
-  if (!store) return;
-  for (const url of PHONON_FILES) {
-    if (await store.match(url).catch(() => undefined)) continue;
-    try {
-      if (url === PHONON_WEIGHTS) await fetchInParts(store, url);
-      else await store.add(url);
-    } catch (e) {
-      console.warn("[phonon] prefetch stopped at " + url, e); // the real load will just download it
-      return;
-    }
-  }
-  console.log("[phonon] checkpoint cached: selecting the voice no longer waits on the network");
-}
-
-// Sequential ranges, each cached under its own key, so a closed tab resumes where it stopped instead
-// of starting the 34 s again. Cache.put refuses a 206, hence the rebuilt Response. A server that
-// refuses ranges, or a browser that will not send the header cross-origin, falls back to one stream.
-async function fetchInParts(store, url) {
-  const probe = await fetch(url, { headers: { Range: "bytes=0-0" } });
-  const total = Number(probe.headers.get("content-range")?.split("/")[1]);
-  if (probe.status !== 206 || !Number.isFinite(total) || total <= 0) return store.add(url);
-  const parts = [];
-  for (let at = 0; at < total; at += PHONON_CHUNK) {
-    const key = `${url}?part=${at}`;
-    const hit = await store.match(key).catch(() => undefined);
-    if (hit) { parts.push(await hit.blob()); continue; }
-    const end = Math.min(at + PHONON_CHUNK, total) - 1;
-    const res = await fetch(url, { headers: { Range: `bytes=${at}-${end}` } });
-    if (res.status !== 206) throw new Error(`range from ${at} answered HTTP ${res.status}`);
-    const blob = await res.blob();
-    await store.put(key, new Response(blob));
-    parts.push(blob);
-  }
-  await store.put(url, new Response(new Blob(parts), { headers: { "content-length": String(total) } }));
-  for (let at = 0; at < total; at += PHONON_CHUNK) await store.delete(`${url}?part=${at}`);
 }
 
 async function phononPump() {
