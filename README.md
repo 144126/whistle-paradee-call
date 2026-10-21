@@ -95,11 +95,11 @@ printf %s "$GROQ_API_KEY"    | pnpm dlx wrangler pages secret put GROQ_API_KEY -
 printf %s "$WHISTLE_OPENROUTER_KEY" | pnpm dlx wrangler pages secret put WHISTLE_OPENROUTER_KEY --project-name whistle
 printf %s "$BASETEN_TTS_URL" | pnpm dlx wrangler pages secret put BASETEN_TTS_URL --project-name whistle  # Pocket TTS voices
 
-rm -rf dist && mkdir dist && cp index.html phonon.html _headers dist/ && cp -r lib dist/
+rm -rf dist && mkdir dist && cp index.html phonon.html edit.html _headers dist/ && cp -r lib dist/
 pnpm dlx wrangler pages deploy dist --project-name whistle --branch main
 ```
 
-`dist/` holds only the two pages, `_headers` (the isolation headers, and a year's caching for `lib/phonon-0.4.0/`) and `lib/`. The functions are picked up from
+`dist/` holds only the three pages, `_headers` (the isolation headers, and a year's caching for `lib/phonon-0.4.0/`) and `lib/`. The functions are picked up from
 `functions/` next to it, so `server.mjs`, `lambda/` and this README are not uploaded. Redeploy with the last
 command after any change.
 
