@@ -150,10 +150,23 @@ function phononFile(name, res) {
   pipeline(createReadStream(path.join(PHONON_DIR, name)), res, () => {});
 }
 
+async function transcription(req, res) {
+  const body = await read(req, res, 1_100_000);
+  if (!body) return;
+  const { onRequestPost } = await import("./functions/api/transcribe.js");
+  forward(res, await onRequestPost({
+    request: new Request(`http://${req.headers.host}/api/transcribe`, {
+      method: "POST", headers: { Origin: req.headers.origin }, body: JSON.stringify(body),
+    }),
+    env: process.env,
+  }));
+}
+
 http.createServer((req, res) => {
   if (!HOSTS.has(req.headers.host)) return send(res, 403, "bad host"); // blocks DNS rebinding
   const url = req.url.split("?")[0];
   if (req.method === "POST" && url === "/api/chat") return chat(req, res);
+  if (req.method === "POST" && url === "/api/transcribe") return transcription(req, res);
   if (req.method === "POST" && url === "/api/tts") return tts(req, res);
   if (req.method === "GET" && url.startsWith(PHONON_PATH)) return phononFile(decodeURIComponent(url.slice(PHONON_PATH.length)), res);
   if (req.method === "GET" && url === "/api/config") return send(res, 200, JSON.stringify({
