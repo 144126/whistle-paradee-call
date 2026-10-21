@@ -365,6 +365,89 @@ build next to Paradee (`onnxruntime-web` is already vendored in `lib/`; Kyutai s
 feasible but ship no official build) is still the interesting direction, but on these numbers it
 would roughly match the voice already there rather than beat it. Not done here.
 
+### Phonon's load, and why it cannot be made fast
+
+Phonon's first load measured 60.5 s (f32) and 96.7 s (q8) here. Both numbers are worth taking apart,
+because the obvious reading of them is wrong twice over.
+
+**The 96.7 s was mostly not loading.** q8 is 69.5 MB and f32 is 107.8 MB, so the *bigger* download
+finished 36 s sooner. At the link speed below, f32's 60.5 s is almost exactly right and q8 should
+have taken 36 s; the other ~60 s was a machine with 265 MB free and 11.7 GB of swap in use. Any
+figure measured under that is a figure about swap.
+
+**The link is the wall, not the Hub.** Measured for the same 8 MB:
+
+| source | throughput |
+|---|---|
+| huggingface.co | 1.59 MB/s |
+| Cloudflare edge (`speed.cloudflare.com`) | 1.92 MB/s |
+| jsdelivr | 1.09 MB/s |
+| huggingface.co, 8 parallel ranges | 1.01 MB/s aggregate |
+
+Parallel is *slower* than one stream, which is what a saturated line looks like. So 64.5 MB takes
+about 34 s whoever serves it, and moving the weights to a CDN, to S3, or to the page's own origin
+buys at most 1.2x. It is still worth doing for the other reasons below, just not for throughput.
+
+**The bytes are nearly irreducible.** Parsing the GGUF tensor tables of both quantizations (185
+tensors, 41.10M params):
+
+| module | tensors | q8 size | note |
+|---|---|---|---|
+| `flow_lm.transformer` | 48 | 20.08 MB | the only quantized part, Q8_0 |
+| `flow_lm.flow_net` | 68 | 18.99 MB | BF16, untouched by `--quant` |
+| `mimi.decoder_transformer` | 20 | 12.60 MB | BF16 |
+| `mimi.decoder` | 22 | 7.95 MB | BF16 convolutions |
+| `flow_lm.condition_provider` | 9 | 4.77 MB | BF16 |
+| everything else | 18 | 0.09 MB | |
+
+`--quant` only ever touches **24 tensors**: Q8_0 20.05 MB, or Q4_K 10.62 MB in `model.q4k.gguf`.
+The other 161 stay BF16 at 44.44 MB, which is 69% of the q8 download and 81% of q4k. So q4k is only
+55.1 MB against 64.5 MB, and a hypothetical build that quantized every linear would land near 29 MB.
+There is also no `mimi.encoder.*` in this checkpoint (it was built with `quantize --no-mimi-encoder`,
+which the wasm's own error string names), so there is nothing dead to strip — and cloning a voice
+from a recording needs that encoder, so this checkpoint only takes precomputed voice embeddings.
+
+**q4k will not load in the browser.** The wasm carries type names for q4_0, q4_1, q5_0, q5_1, q6k,
+q8_0, q8_1 and q8k, and no q4_k, next to an `unsupported quantization '` error string. Pointing the
+`q8` slot at `model.q4k.gguf` would therefore download 55 MB and then fail. Not attempted.
+
+Put together: a 100x faster load would need 1.9 MB on the wire, and the floor is 29 MB even in a
+build that does not exist. **That is not reachable.** What is reachable is never waiting for it:
+
+- **Pinned `ModelSpec` instead of `hf://...`** — the package's Hub API lookup costs 0.52 s on every
+  load, and `index.html` now names every file at a fixed commit instead. The URLs it builds are byte
+  for byte the ones the Hub lookup produced, so anything already cached still hits.
+- **`PHONON_BASE`, one constant** — on an S3 or CloudFront static site, point it at the bucket and
+  the checkpoint comes from the page's own origin. S3 has no per-file cap; Cloudflare Pages refuses
+  any asset over 25 MiB, so the 64.5 MB GGUF cannot live there.
+- **Idle prefetch** — once Paradee is up and the page is quiet, `prefetchPhonon()` fills the
+  package's own cache (`phonon-tts-v1`) with the checkpoint *without starting the model*, so nothing
+  is resident until the voice is actually picked. `PHONON_PREFETCH = false` turns it off, and it
+  skips itself on `saveData` or a 2g connection.
+- **Resumable in 8 MB ranges** — each range is cached under its own key and assembled at the end, so
+  a tab closed mid-download resumes instead of starting the 34 s again. `Cache.put` refuses a 206,
+  hence the rebuilt `Response`. A server that refuses ranges, or a browser that will not send the
+  header cross-origin, falls back to one stream. `huggingface.co` answers an `OPTIONS` preflight with
+  `access-control-allow-headers: range` and exposes `Content-Range`, and LFS redirects to
+  `us.aws.cdn.hf.co`, which both get a `preconnect`.
+- **Kept alive** — the worker is disposed only when the device changes, so switching to another voice
+  and back costs nothing. It measured 605 MB resident, which is the reason it is not loaded eagerly.
+
+The warm path is already well built and is not where the remaining time is: the package streams into
+one preallocated buffer, caches from a clone rather than re-serialising, and `instantiateStreaming`
+does reach Chrome's code cache because the server sends `application/wasm`. What is left of its
+3.13 s is the 64.5 MB Cache API read and the Rust-side GGUF parse. OPFS with
+`createSyncAccessHandle` in the worker would beat the Cache API at that size, and pre-sizing the
+shared heap would avoid repeated `memory.grow` over ~100 MB. Neither is done here.
+
+**On an AWS static site** (S3 behind CloudFront), two things matter beyond the above. Threads need
+the page cross-origin isolated, so CloudFront must attach a response-headers policy sending
+`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` — without
+it `onnxruntime-web` and Phonon both silently drop to one thread, which costs about 40% and shows up
+nowhere. `#meta` now prints the thread count each engine actually got, and the page says so outright
+when `crossOriginIsolated` is false. And `.wasm` must be served as `application/wasm`, or
+`instantiateStreaming` falls back to the slower non-streaming path.
+
 ### Orpheus on Groq
 
 Groq's only text-to-speech is Canopy Labs Orpheus, so "a Kyutai voice on Groq" is not available;
