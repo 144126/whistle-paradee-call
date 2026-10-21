@@ -419,6 +419,23 @@ in fresh processes is this machine swapping, not the page: the cache read is 13-
 same load measured 0.64 s phase by phase with more memory free. After that, speech starts 150-250 ms after
 pressing speak, most of it the model reading the sentence before its first frame.
 
+**It calls, too.** The call button holds a voice call. Whistle hears you through `lib/mic.mjs`, the same
+recognizer and pause detection as the main page, started once the voice is in so the two downloads never
+share the line. Groq answers through this page's server via `lib/chat.mjs`, which the main page's calls now
+go through as well. Phonon speaks the reply as it streams, sentence by sentence, with the first piece cut at a
+clause, and the mic is off while it plays. Measured with a looped recording of "What is the capital of
+France?": the first word of the answer came 0.77-1.04 s after the turn ended, which is 2.21-2.48 s after
+you stop talking, 1.44 s of that being the pause that ends a turn. The main page's call with Paradee took
+1.30-1.67 s for the same.
+
+**On Cloudflare** the page deploys with the commands above (`phonon.html` is in the copy line). There is
+no local checkpoint there, so `/api/config` has no `phonon` path and the page uses the Hub: the first
+visit downloads 65 MB, resumably, into the Cache API, and later visits load from it. Whistle's 17.8 MB
+come from the Hub once too. Calls go through the existing `/api/chat` function with the `GROQ_API_KEY`
+secret. Pages itself cannot hold the checkpoint (25 MiB per file). An R2 bucket with CORS could, and
+`/api/config` returning its URL as `phonon` is all the page needs, but on a ~2 MB/s line it would not be
+faster than the Hub (1.92 against 1.59 MB/s measured).
+
 Why the rest cannot go: a first download over a ~2 MB/s line is 65 MB / 2 MB/s whoever serves it, and
 the file cannot shrink much, because 44.44 MB of it (69%, all of Mimi and part of flow_lm) is BF16 that
 `q8` never touched. A voice stored as its KV cache would skip the 295 ms prefill (the wasm build reads

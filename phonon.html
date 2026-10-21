@@ -55,7 +55,12 @@
   fieldset input { position: absolute; opacity: 0; pointer-events: none; }
   fieldset label:has(input:checked) { background: var(--bg); color: var(--text); font-weight: 600; }
   fieldset:has(input:disabled) label { cursor: default; }
-  #stats { min-height: 21px; font-size: var(--t14); color: var(--muted); font-variant-numeric: tabular-nums; }
+  button.secondary { background: transparent; color: var(--text); box-shadow: inset 0 0 0 1px var(--edge); }
+  .info { margin: 0; min-height: 21px; font-size: var(--t14); color: var(--muted); font-variant-numeric: tabular-nums; }
+  #chat { display: grid; gap: var(--s8); }
+  #chat:empty { display: none; }
+  #chat p { margin: 0; }
+  #chat .who { display: inline-block; min-width: 2.5em; margin-right: var(--s8); font-size: var(--t14); font-weight: 600; color: var(--muted); }
   a { color: var(--text); font-size: var(--t14); text-decoration: underline; text-underline-offset: 3px; }
   :focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
   fieldset label:has(input:focus-visible) { outline: 2px solid var(--text); outline-offset: 2px; }
@@ -71,9 +76,8 @@
     <p id="status" data-kind="loading" role="status" aria-live="polite"><span id="icon"></span><span id="label">loading</span></p>
     <div id="bar" hidden><i></i></div>
   </div>
-  <textarea id="text" placeholder="type something to hear it" aria-label="text to speak">this voice runs on your own machine. it loaded before you asked, so it answers the moment you do.</textarea>
   <div class="row">
-    <button id="speak" disabled>speak</button>
+    <button id="call" disabled>call</button>
     <fieldset id="device">
       <legend>where it runs</legend>
       <label title="the processor, measured fastest and safest"><input type="radio" name="device" value="cpu">cpu</label>
@@ -81,7 +85,11 @@
       <label title="the gpu only; fails where there is none"><input type="radio" name="device" value="webgpu">webgpu</label>
     </fieldset>
   </div>
-  <p id="stats"></p>
+  <p id="callinfo" class="info"></p>
+  <div id="chat" aria-live="polite"></div>
+  <textarea id="text" placeholder="type something to hear it" aria-label="text to speak">this voice runs on your own machine. it loaded before you asked, so it answers the moment you do.</textarea>
+  <div class="row"><button id="speak" class="secondary" disabled>speak</button></div>
+  <p id="stats" class="info"></p>
   <a href="./">back to whistle</a>
 </main>
 <script type="module">
@@ -91,6 +99,9 @@ const CACHE = "phonon-tts-v1"; // CACHE_NAME in lib/phonon-0.4.0/fetch.js: the p
 const PART = 8 << 20; // a tab closed mid-download loses at most this much
 const GAIN = 2; // Phonon peaks at 0.42-0.45, so this lands just under full scale
 const LEAD = 0.03; // s of audio scheduled ahead of the clock, so the first chunk never starts late
+const TURN_MS = 1440; // on a call, the silence that ends your turn, as on the main page
+const ECHO_MS = 400; // after a reply, the room's echo of its last words is not you talking
+const GROQ_MODEL = "openai/gpt-oss-120b"; // unless the main page has picked another (localStorage groq_model, same origin)
 const HUB = `https://huggingface.co/${CHECKPOINT.repo}/resolve/${CHECKPOINT.commit}/`;
 const TOTAL = Object.values(CHECKPOINT.files).reduce((a, b) => a + b, 0);
 const ICONS = {
@@ -103,18 +114,23 @@ const $ = (id) => document.getElementById(id);
 const saved = { get: (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
 const mb = (n) => (n / 1e6).toFixed(1);
 
-// Both start before anything else: the package's code, and where its files come from. server.mjs
-// says when it has the checkpoint on this machine's disk; everywhere else it is the Hub.
+// All of this starts before anything else: the package's code, the model side of a call, and where
+// the checkpoint comes from. server.mjs says when it has it on this machine's disk; everywhere else
+// it is the Hub.
 const opened = performance.now();
 const lib = import("./lib/phonon-0.4.0/index.js");
-const base = fetch("/api/config").then((r) => (r.ok ? r.json() : {})).then(
-  (c) => (c.phonon ? new URL(c.phonon, location.href).href : HUB),
-  () => HUB,
-);
+const chat = import("./lib/chat.mjs");
+const config = fetch("/api/config").then((r) => (r.ok ? r.json() : {})).catch(() => ({}));
+const base = config.then((c) => (c.phonon ? new URL(c.phonon, location.href).href : HUB));
 
-let tts = null, running = null, readyText = "", device = saved.get("phonon-device", "cpu"), booting = null, stream = null, ctx = null, sources = [], persisted = false;
+let tts = null, running = null, readyText = "", device = saved.get("phonon-device", "cpu"), booting = null, ctx = null, persisted = false;
+let talking = null; // the speak button's speech while it plays
+let call = null; // the live call, or null
+let ear = null; // the speech recognizer, started once the voice is in so the two downloads never share the line
+let canCall = false, heardReady = false, starting = false;
 if (!["cpu", "auto", "webgpu"].includes(device)) device = "cpu";
 document.querySelector(`input[value=${device}]`).checked = true;
+config.then((c) => { canCall = Boolean(c.providers?.groq); refresh(); });
 
 function status(kind, text) {
   $("status").dataset.kind = kind;
@@ -130,9 +146,13 @@ function unstick() {
 }
 
 function refresh() {
-  $("speak").disabled = !tts || Boolean(booting) || (!stream && !$("text").value.trim());
-  $("speak").textContent = stream ? "stop" : "speak";
-  for (const input of document.querySelectorAll("#device input")) input.disabled = Boolean(booting || stream);
+  const loading = Boolean(booting);
+  $("speak").disabled = !tts || loading || Boolean(call) || (!talking && !$("text").value.trim());
+  $("speak").textContent = talking ? "stop" : "speak";
+  $("call").disabled = starting || (!call && (!tts || loading || !canCall));
+  $("call").textContent = call ? "hang up" : "call";
+  $("call").title = canCall ? "" : "this page's server has no groq key";
+  for (const input of document.querySelectorAll("#device input")) input.disabled = Boolean(loading || talking || call);
 }
 
 // ---------- a first download from the Hub ----------
@@ -276,19 +296,81 @@ async function boot(since) {
     persisted = true; // asked once: Chrome decides from how much the site is used, without a prompt
     navigator.storage?.persist?.().then((ok) => console.log(`[phonon] storage ${ok ? "kept" : "evictable"}: ${mb(TOTAL)} MB checkpoint`));
   }
+  hearing().catch(() => {}); // speech recognition for a call, now that the voice no longer needs the line; a failure shows on call
 }
 
 function load(since) {
   booting = boot(since).finally(() => { booting = null; refresh(); });
 }
 
-// ---------- speaking ----------
+// ---------- speech out ----------
+// Pieces of text queue up and play back to back, one Phonon stream each, with the audio scheduled
+// end to end so no gap opens between them. The speak button gives it one piece; a call gives it a
+// reply sentence by sentence as the model writes it.
+function speech(on = {}) {
+  const queue = [], live = new Set();
+  let ended = false, busy = false, stopped = false, at = 0, first = false, current = null;
+  const settle = () => {
+    if (!ended || busy || queue.length || live.size || stopped) return;
+    stopped = true;
+    on.done?.();
+  };
+  async function pump() {
+    if (busy) return;
+    busy = true;
+    try {
+      while (queue.length && !stopped) {
+        current = tts.stream(queue.shift());
+        for await (const pcm of current) {
+          if (stopped) break; // breaking the loop cancels the stream
+          if (!first) { first = true; at = ctx.currentTime + LEAD; on.first?.(performance.now() + LEAD * 1000); }
+          for (let i = 0; i < pcm.length; i++) pcm[i] *= GAIN;
+          const buf = ctx.createBuffer(1, pcm.length, ctx.sampleRate);
+          buf.copyToChannel(pcm, 0);
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(ctx.destination);
+          src.onended = () => { live.delete(src); settle(); };
+          at = Math.max(at, ctx.currentTime + 0.005); // generation fell behind: start now rather than in the past
+          src.start(at);
+          at += buf.duration;
+          live.add(src);
+          on.audio?.(buf.duration);
+        }
+        if (!stopped) on.stats?.(await current.done);
+        current = null;
+      }
+    } catch (e) {
+      if (!stopped) on.error?.(e);
+    }
+    busy = false;
+    settle();
+  }
+  return {
+    say(text) {
+      if (stopped || !/[\p{L}\p{N}]/u.test(text)) return; // nothing to say in it
+      queue.push(text);
+      pump();
+    },
+    end() { ended = true; settle(); },
+    stop() {
+      stopped = true;
+      queue.length = 0;
+      current?.cancel();
+      for (const src of live) { src.onended = null; try { src.stop(); } catch {} }
+      live.clear();
+    },
+  };
+}
 
-function stop() {
-  stream?.cancel();
-  stream = null;
-  for (const s of sources) { s.onended = null; try { s.stop(); } catch {} }
-  sources = [];
+async function sound() {
+  ctx ??= new AudioContext({ sampleRate: tts.sampleRate, latencyHint: "interactive" });
+  await ctx.resume();
+}
+
+function stopTalking() {
+  talking?.stop();
+  talking = null;
   refresh();
 }
 
@@ -296,49 +378,188 @@ async function speak() {
   const text = $("text").value.trim();
   if (!text || !tts) return;
   unstick();
-  ctx ??= new AudioContext({ sampleRate: tts.sampleRate, latencyHint: "interactive" });
-  await ctx.resume();
+  await sound();
   const clicked = performance.now();
-  let mine = null, first = 0, at = 0, audio = 0, generated = false;
-  const settle = () => { if (generated && !sources.length && stream === mine) stop(); };
+  let first = 0, audio = 0, gen = 0;
   $("stats").textContent = "";
+  const out = (talking = speech({
+    first: (when) => { first = when - clicked; $("stats").textContent = `first sound ${Math.round(first)} ms`; },
+    audio: (s) => { audio += s; },
+    stats: (s) => { gen += s.totalMs / 1000; },
+    done: () => {
+      if (talking !== out) return;
+      talking = null;
+      $("stats").textContent = `first sound ${Math.round(first)} ms · ${audio.toFixed(1)} s of speech in ${gen.toFixed(1)} s · ${(audio / gen).toFixed(1)}x real time`;
+      refresh();
+    },
+    error: (e) => {
+      status("error", `speaking failed: ${e.message}. reload to start the voice again.`);
+      stopTalking();
+    },
+  }));
+  out.say(text);
+  out.end();
+  refresh();
+}
+
+// ---------- the call ----------
+// Speech in comes from lib/mic.mjs, the same Whistle recognizer and pause detection as the main page;
+// the reply comes from Groq through this page's server (lib/chat.mjs), and plays as it is written.
+
+function hearing() {
+  ear ??= import("./lib/mic.mjs").then(({ create_ear }) => create_ear({
+    ready: () => { heardReady = true; if (call?.state === "listening") info("listening"); },
+    hear: () => heard(),
+    words: (text) => words(text),
+    turn: (text) => turned(text),
+    error: (message) => info(`speech recognition: ${message}`),
+  }));
+  return ear;
+}
+
+const info = (text) => { $("callinfo").textContent = text; };
+
+function line(who, text) {
+  const p = document.createElement("p");
+  const tag = document.createElement("span");
+  tag.className = "who";
+  tag.textContent = who;
+  p.append(tag, document.createTextNode(text));
+  $("chat").append(p);
+  return p;
+}
+
+async function startCall() {
+  if (call) return hangUp();
+  unstick();
+  stopTalking();
+  starting = true; // until the microphone answers, a second click must not start a second call
+  refresh();
   try {
-    mine = stream = tts.stream(text);
-    refresh();
-    for await (const pcm of mine) {
-      if (stream !== mine) break; // breaking the loop cancels the stream
-      if (!first) {
-        first = performance.now() - clicked;
-        at = ctx.currentTime + LEAD;
-        $("stats").textContent = `first sound ${Math.round(first + LEAD * 1000)} ms`;
-      }
-      for (let i = 0; i < pcm.length; i++) pcm[i] *= GAIN;
-      const buf = ctx.createBuffer(1, pcm.length, ctx.sampleRate);
-      buf.copyToChannel(pcm, 0);
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(ctx.destination);
-      src.onended = () => { sources = sources.filter((x) => x !== src); settle(); };
-      at = Math.max(at, ctx.currentTime + 0.005); // generation fell behind: start now rather than in the past
-      src.start(at);
-      at += buf.duration;
-      audio += buf.duration;
-      sources.push(src);
-    }
-    const stats = await mine.done;
-    if (stream !== mine) return; // stopped: the first-sound figure stays up
-    const gen = stats.totalMs / 1000;
-    $("stats").textContent = `first sound ${Math.round(first + LEAD * 1000)} ms · ${audio.toFixed(1)} s of speech in ${gen.toFixed(1)} s · ${(audio / gen).toFixed(1)}x real time`;
-    generated = true;
-    settle();
+    const e = await hearing();
+    await sound();
+    await e.open(); // asks for the microphone
+    e.turn_ms = TURN_MS;
+    call = { ear: e, history: [], pending: "", queued: "", state: "listening", abort: null, out: null, turned: 0, you: null, ai: null };
+    $("chat").textContent = "";
+    e.listen(true);
+    info(heardReady ? "listening" : "listening · speech recognition still loading");
+  } catch (err) {
+    info(`the call could not start: ${err.message}`);
+  }
+  starting = false;
+  refresh();
+}
+
+function hangUp() {
+  const c = call;
+  call = null; // first: what the ear flushes on its way out has nowhere to go
+  c.abort?.abort();
+  c.out?.stop();
+  c.ear.close();
+  info("call ended");
+  refresh();
+}
+
+// you started talking
+function heard() {
+  const c = call;
+  if (!c) return;
+  if (c.state === "thinking") { // the reply has not started playing, so this continues your turn
+    c.abort?.abort();
+    c.out?.stop();
+    c.out = null;
+    c.ai?.remove();
+    c.ai = null;
+    c.state = "listening";
+    info("listening");
+  }
+  c.you ??= line("you", c.pending ? c.pending + " …" : "…");
+}
+
+function words(text) {
+  const c = call;
+  if (!c) return;
+  c.you ??= line("you", "");
+  c.you.lastChild.textContent = [c.pending, text].filter(Boolean).join(" ");
+}
+
+// your turn is over
+function turned(text) {
+  const c = call;
+  if (!c) return;
+  if (c.state === "speaking") { // said as the reply began: it is answered next
+    c.queued = [c.queued, text].filter(Boolean).join(" ").trim();
+    return;
+  }
+  const full = [c.pending, text].filter(Boolean).join(" ").trim();
+  if (!full) { c.you?.remove(); c.you = null; return; } // a noise, not words
+  reply(c, full);
+}
+
+async function reply(c, text) {
+  c.state = "thinking";
+  c.pending = text; // kept until the reply starts playing, in case you go on talking
+  c.turned = performance.now();
+  c.you ??= line("you", "");
+  c.you.lastChild.textContent = text;
+  c.ai = line("ai", "");
+  info("thinking");
+  const abort = (c.abort = new AbortController());
+  const model = saved.get("groq_model", GROQ_MODEL) || GROQ_MODEL;
+  let said = "";
+  const out = (c.out = speech({
+    first: (when) => {
+      if (call !== c || c.out !== out) return;
+      c.state = "speaking";
+      c.pending = "";
+      c.you = null;
+      c.ear.listen(false); // the mic is ignored while the reply plays, so the call never hears itself
+      const ms = when - c.turned;
+      info(`answered in ${((ms + TURN_MS) / 1000).toFixed(2)} s: the ${(TURN_MS / 1000).toFixed(2)} s pause that ends your turn, then ${Math.round(ms)} ms · groq ${model.split("/").pop()}`);
+    },
+    done: () => {
+      if (call !== c || c.out !== out) return;
+      c.out = null;
+      c.state = "listening";
+      setTimeout(() => {
+        if (call !== c || c.state !== "listening") return;
+        if (c.queued) {
+          const next = c.queued;
+          c.queued = "";
+          return reply(c, next);
+        }
+        c.ear.listen(true);
+      }, ECHO_MS);
+    },
+    error: (e) => { if (call === c) info(`speaking failed: ${e.message}`); },
+  }));
+  try {
+    const { SYSTEM, stream_chat, pieces } = await chat;
+    const cut = pieces((piece) => out.say(piece));
+    const messages = [{ role: "system", content: SYSTEM }, ...c.history, { role: "user", content: text }];
+    await stream_chat({ provider: "groq", model, messages, signal: abort.signal }, (delta) => {
+      said += delta;
+      c.ai.lastChild.textContent = said;
+      cut.add(delta);
+    });
+    cut.end();
+    out.end();
+    c.history.push({ role: "user", content: text }, { role: "assistant", content: said });
+    c.history.splice(0, Math.max(0, c.history.length - 12));
   } catch (e) {
-    if (mine && stream !== mine) return;
-    status("error", `speaking failed: ${e.message}. reload to start the voice again.`);
-    stop();
+    if (e.name === "AbortError" || call !== c) return;
+    out.stop();
+    c.out = null;
+    c.state = "listening";
+    c.pending = "";
+    c.ear.listen(true);
+    info(e.message);
   }
 }
 
-$("speak").onclick = () => (stream ? stop() : speak());
+$("speak").onclick = () => (talking ? stopTalking() : speak());
+$("call").onclick = () => startCall();
 $("text").oninput = refresh;
 $("text").onkeydown = (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (!$("speak").disabled) $("speak").click(); } };
 $("device").onclick = (e) => { if (e.target.value === running) unstick(); }; // re-picking the running device changes nothing, so no change event
