@@ -614,14 +614,21 @@ function loadPhonon(device) {
     phonon?.ready.then((tts) => tts.dispose(), () => {});
     phonon = {
       device,
-      ready: import("./lib/phonon-0.4.0/index.js")
-        .then(({ PhononTTS }) => PhononTTS.load({
-          lang: "en",
-          quant: "q8",
-          device,
-          threads: "auto",
-          onProgress: (p) => { if (p.total && !p.cached) $("meta").textContent = `Phonon ${p.file} ${Math.round((p.loaded / p.total) * 100)}%`; },
-        }))
+      // the checkpoint comes from this page's own server, into the package's cache, as on the Phonon page
+      ready: Promise.all([import("./lib/phonon-0.4.0/index.js"), import("./lib/phonon-checkpoint.mjs")])
+        .then(async ([{ PhononTTS }, { TOTAL, cache_checkpoint, model_spec }]) => {
+          let done = 0, shown = 0;
+          await cache_checkpoint({
+            bytes: (n, network) => {
+              done += n;
+              const now = performance.now();
+              if (!network || (now - shown < 100 && done < TOTAL)) return;
+              shown = now;
+              $("meta").textContent = `Phonon ${Math.round((done / TOTAL) * 100)}%`;
+            },
+          });
+          return PhononTTS.load({ lang: "en", quant: "q8", device, threads: "auto", model: model_spec() });
+        })
         .then((tts) => {
           $("meta").textContent = `Phonon: ${tts.device}, ${tts.threads} thread${tts.threads === 1 ? "" : "s"}` +
             (tts.device === "cpu" && device !== "cpu" ? ` (${tts.deviceReason})` : "");

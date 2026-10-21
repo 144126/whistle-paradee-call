@@ -78,10 +78,10 @@ async function tts(event, stream) {
 async function file(rawPath, stream) {
   const rel = rawPath === "/" ? "index.html" : rawPath.slice(1);
   // lib/ is nested up to six deep: lib/phonon-0.4.0/wasm-threads/snippets/<hash>/src/workerHelpers.js
-  if (!/^(index\.html|phonon\.html|lib(?:\/[\w.\-]+){1,6})$/.test(rel) || rel.includes("..")) return reply(stream, 404, "not found");
+  if (!/^(index\.html|phonon\.html|edit\.html|lib(?:\/[\w.\-]+){1,6}|models\/[\w.\-]+\/[\w.\-]+)$/.test(rel) || rel.includes("..")) return reply(stream, 404, "not found");
   try {
-    // a directory named for its version (lib/phonon-0.4.0/) never changes in place; the rest revalidates
-    const cache = /^lib\/[\w.]+-\d+\.\d+\.\d+\//.test(rel) ? "public, max-age=31536000, immutable" : "no-cache";
+    // a directory named for its version (lib/phonon-0.4.0/, models/phonon-31m-en-8c64b55/) never changes in place; the rest revalidates
+    const cache = /^(lib\/[\w.]+-\d+\.\d+\.\d+|models\/[\w.\-]+)\//.test(rel) ? "public, max-age=31536000, immutable" : "no-cache";
     reply(stream, 200, await fs.readFile(path.join(ROOT, rel)), { "Content-Type": TYPES[path.extname(rel)] ?? "application/octet-stream", "Cache-Control": cache });
   } catch { reply(stream, 404, "not found"); }
 }

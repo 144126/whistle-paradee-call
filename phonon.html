@@ -93,17 +93,13 @@
   <a href="./">back to whistle</a>
 </main>
 <script type="module">
-import { CHECKPOINT } from "./lib/phonon-checkpoint.mjs";
+import { TOTAL, cache_checkpoint, model_spec } from "./lib/phonon-checkpoint.mjs";
 
-const CACHE = "phonon-tts-v1"; // CACHE_NAME in lib/phonon-0.4.0/fetch.js: the package reads its files from here before the network
-const PART = 8 << 20; // a tab closed mid-download loses at most this much
 const GAIN = 2; // Phonon peaks at 0.42-0.45, so this lands just under full scale
 const LEAD = 0.03; // s of audio scheduled ahead of the clock, so the first chunk never starts late
 const TURN_MS = 1440; // on a call, the silence that ends your turn, as on the main page
 const ECHO_MS = 400; // after a reply, the room's echo of its last words is not you talking
 const GROQ_MODEL = "openai/gpt-oss-120b"; // unless the main page has picked another (localStorage groq_model, same origin)
-const HUB = `https://huggingface.co/${CHECKPOINT.repo}/resolve/${CHECKPOINT.commit}/`;
-const TOTAL = Object.values(CHECKPOINT.files).reduce((a, b) => a + b, 0);
 const ICONS = {
   loading: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-opacity=".25" stroke-width="2"/><path class="spin" d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
   ready: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="currentColor"/><path d="M4.8 8.2l2.1 2.1 4.3-4.6" fill="none" style="stroke:var(--bg)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -114,14 +110,12 @@ const $ = (id) => document.getElementById(id);
 const saved = { get: (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
 const mb = (n) => (n / 1e6).toFixed(1);
 
-// All of this starts before anything else: the package's code, the model side of a call, and where
-// the checkpoint comes from. server.mjs says when it has it on this machine's disk; everywhere else
-// it is the Hub.
+// All of this starts before anything else: the package's code, the model side of a call, and
+// whether this page's server can reach Groq.
 const opened = performance.now();
 const lib = import("./lib/phonon-0.4.0/index.js");
 const chat = import("./lib/chat.mjs");
 const config = fetch("/api/config").then((r) => (r.ok ? r.json() : {})).catch(() => ({}));
-const base = config.then((c) => (c.phonon ? new URL(c.phonon, location.href).href : HUB));
 
 let tts = null, running = null, readyText = "", device = saved.get("phonon-device", "cpu"), booting = null, ctx = null, persisted = false;
 let talking = null; // the speak button's speech while it plays
@@ -155,80 +149,12 @@ function refresh() {
   for (const input of document.querySelectorAll("#device input")) input.disabled = Boolean(loading || talking || call);
 }
 
-// ---------- a first download from the Hub ----------
-// The page fills the package's cache itself (it keeps each file under its URL and looks there before
-// the network), so that a first download can resume and show its progress. Files from this
-// machine's own server are left to the package: it caches them after the load, off the critical
-// path, and a disk is fast enough that resuming would buy nothing.
-
-async function readBody(res, onBytes) {
-  const reader = res.body.getReader();
-  const chunks = [];
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) return new Blob(chunks);
-    chunks.push(value);
-    onBytes(value.length, true);
-  }
-}
-
-async function fetchOk(url, init) {
-  const res = await fetch(url, { cache: "no-store", ...init }); // kept in the Cache API; the HTTP cache keeping it too would store it twice
-  if (!res.ok) throw new Error(`${url.split("/").pop()} answered HTTP ${res.status}`);
-  return res;
-}
-
-// Sequential ranges, each cached under its own key until the whole file is in, so a closed tab
-// resumes where it stopped instead of starting the ~34 s again. Sequential because 8 parallel
-// ranges measured slower than one stream (1.72 against 2.03 MB/s): the line is the limit, not the
-// connection. Cache.put refuses a 206, hence each part's fresh Response.
-async function fetchParts(cache, url, size, onBytes) {
-  const parts = [];
-  for (let at = 0; at < size; at += PART) {
-    const end = Math.min(at + PART, size) - 1;
-    let part = await cache.match(`${url}?part=${at}`).then((r) => r?.blob(), () => undefined);
-    if (part?.size === end - at + 1) onBytes(part.size, false);
-    else {
-      const res = await fetchOk(url, { headers: { Range: `bytes=${at}-${end}` } }).catch((e) => {
-        if (at) throw e;
-        return fetchOk(url); // the range itself was refused: one stream, not resumable
-      });
-      if (res.status === 200 && at === 0) return cache.put(url, new Response(await readBody(res, onBytes))); // ranges ignored: this is the whole file
-      if (res.status !== 206) throw new Error(`bytes ${at}-${end} answered HTTP ${res.status}`);
-      part = await readBody(res, onBytes);
-      if (part.size !== end - at + 1) throw new Error(`bytes ${at}-${end} arrived as ${part.size}`);
-      await cache.put(`${url}?part=${at}`, new Response(part));
-    }
-    parts.push(part);
-  }
-  status("loading", "saving"); // one more write of the whole file: seconds on a slow disk
-  await cache.put(url, new Response(new Blob(parts), { headers: { "content-length": String(size) } }));
-  await Promise.all(parts.map((_, i) => cache.delete(`${url}?part=${i * PART}`)));
-}
-
-// The small files go alongside the weights rather than before them: each costs a redirect and a
-// fresh connection from here (about 1.3 s to a first byte), which in a row came to seconds of nothing.
-async function cacheFromHub(from, onBytes) {
-  const cache = typeof caches === "undefined" ? null : await caches.open(CACHE).catch(() => null);
-  if (!cache) return; // no Cache API here (insecure context, blocked storage): the package downloads on its own
-  const files = Object.entries(CHECKPOINT.files);
-  const hits = await Promise.all(files.map(([name]) => cache.match(from + name).catch(() => undefined)));
-  if (hits.some((hit) => !hit)) status("loading", `downloading ${mb(TOTAL)} MB`);
-  await Promise.all(files.map(async ([name, size], i) => {
-    if (hits[i]) return onBytes(size, false);
-    if (size > PART) return fetchParts(cache, from + name, size, onBytes);
-    await cache.put(from + name, new Response(await readBody(await fetchOk(from + name), onBytes)));
-  }));
-}
-
 // ---------- loading the model ----------
 
 async function boot(since) {
   status("loading", "loading");
   refresh();
-  const from = await base;
-  const sourced = performance.now();
-  let done = 0, fetched = 0, firstByte = 0, shown = 0, copied = false;
+  let done = 0, fetched = 0, firstByte = 0, shown = 0;
   const marks = []; // [time, bytes fetched] over the last 10 s: steady against a line that swings 0.7-2.3 MB/s, past the connection's ramp-up
   const onBytes = (n, network) => {
     done += n;
@@ -243,14 +169,12 @@ async function boot(since) {
     const rate = (fetched - marks[0][1]) / ((now - marks[0][0]) / 1000);
     status("loading", `${mb(done)} of ${mb(TOTAL)} MB` + (now - firstByte >= 3000 && rate > 0 ? ` · ${mb(rate)} MB/s · ${Math.ceil((TOTAL - done) / rate)} s left` : ""));
   };
-  if (!from.startsWith(location.origin)) {
-    try {
-      await cacheFromHub(from, onBytes);
-    } catch (e) {
-      $("bar").hidden = true;
-      status("error", `the download stopped at ${mb(done)} MB (${e.message}). reload to pick up where it stopped.`);
-      return;
-    }
+  try {
+    await cache_checkpoint({ bytes: onBytes, saving: () => status("loading", "saving") });
+  } catch (e) {
+    $("bar").hidden = true;
+    status("error", `the download stopped at ${mb(done)} MB (${e.message}). reload to pick up where it stopped.`);
+    return;
   }
   $("bar").hidden = true;
   const cached = performance.now();
@@ -261,19 +185,7 @@ async function boot(since) {
       lang: "en",
       quant: "q8", // the only format the package puts on WebGPU, and measured no slower than f32 in wasm
       device,
-      model: {
-        weights: { q8: from + "model.q8.gguf" },
-        tokenizer: from + "tokenizer.json",
-        config: from + "config.json",
-        voices: { default: from + "default-voice.safetensors" },
-        defaultVoice: "default",
-      },
-      onProgress: (p) => {
-        if (p.cached || !p.total) return;
-        copied = true;
-        if (p.loaded < p.total) status("loading", `copying ${p.file} from this disk ${Math.round((p.loaded / p.total) * 100)}%`);
-        else if (p.file === "weights" || p.file.startsWith("voice:")) status("loading", "starting"); // the small files finish while the weights still copy
-      },
+      model: model_spec(), // every file is in the package's cache by now, so this reads no network
     });
     tts?.dispose(); // only now: a device that fails to start leaves the working one in place
     tts = next;
@@ -287,11 +199,11 @@ async function boot(since) {
     return;
   }
   const ready = performance.now();
-  const where = fetched ? "downloaded" : copied ? "copied from this disk" : "cache";
+  const where = fetched ? "downloaded" : "cache";
   const fell = tts.device !== device ? ` (${tts.deviceReason})` : "";
   readyText = `ready in ${((ready - since) / 1000).toFixed(2)} s · ${where} · ${tts.device}${fell} · ${tts.threads} thread${tts.threads === 1 ? "" : "s"}`;
   status("ready", readyText);
-  console.log(`[phonon] ready in ${Math.round(ready - since)} ms: source ${Math.round(sourced - since)}, hub download ${Math.round(cached - sourced)}, model load ${Math.round(ready - cached)}`);
+  console.log(`[phonon] ready in ${Math.round(ready - since)} ms: checkpoint ${Math.round(cached - since)}, model load ${Math.round(ready - cached)}`);
   if (!persisted) {
     persisted = true; // asked once: Chrome decides from how much the site is used, without a prompt
     navigator.storage?.persist?.().then((ok) => console.log(`[phonon] storage ${ok ? "kept" : "evictable"}: ${mb(TOTAL)} MB checkpoint`));

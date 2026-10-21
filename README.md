@@ -95,7 +95,7 @@ printf %s "$GROQ_API_KEY"    | pnpm dlx wrangler pages secret put GROQ_API_KEY -
 printf %s "$WHISTLE_OPENROUTER_KEY" | pnpm dlx wrangler pages secret put WHISTLE_OPENROUTER_KEY --project-name whistle
 printf %s "$BASETEN_TTS_URL" | pnpm dlx wrangler pages secret put BASETEN_TTS_URL --project-name whistle  # Pocket TTS voices
 
-rm -rf dist && mkdir dist && cp index.html phonon.html edit.html _headers dist/ && cp -r lib dist/
+rm -rf dist && mkdir dist && cp index.html phonon.html edit.html _headers dist/ && cp -r lib models dist/
 pnpm dlx wrangler pages deploy dist --project-name whistle --branch main
 ```
 
@@ -118,8 +118,10 @@ not been deployed to a real AWS account**, so expect to adjust the IAM/URL steps
 Needs the AWS CLI configured, and `zip`.
 
 ```bash
-# 1. package: the handler must sit next to index.html, phonon.html and lib/
-mkdir -p dist && cp lambda/handler.mjs index.html phonon.html dist/ && cp -r lib dist/
+# 1. package: the handler must sit next to the pages, lib/ and models/. With the Phonon checkpoint in
+#    models/ the zip is over Lambda's 50 MB direct-upload limit, so step 4 uploads it through S3
+#    (--code S3Bucket=...,S3Key=whistle.zip after `aws s3 cp whistle.zip s3://...`)
+mkdir -p dist && cp lambda/handler.mjs index.html phonon.html edit.html dist/ && cp -r lib models dist/
 (cd dist && zip -qr ../whistle.zip .)
 
 # 2. role (once)
@@ -385,21 +387,23 @@ everything cached, median of 5):
 
 What the page does about it:
 
-- **No Hub lookup.** It hands the package a ModelSpec pinned file by file instead of `hf://...`. The
-  commit and each file's exact size live in `lib/phonon-checkpoint.mjs`, which the page and `server.mjs`
-  share. That alone took the measured load from 1169 to 636 ms.
+- **The model is in this repo.** `models/phonon-31m-en-8c64b55/` holds the checkpoint of
+  `gradium/phonon-31m-en` at commit `8c64b55` (Apache-2.0, its license and model card beside it), so
+  every page loads it from its own origin, here and deployed, with no Hugging Face lookup (that alone
+  took the measured load from 1169 to 636 ms), no redirect to a second host and no dependence on the Hub
+  staying up. The 64.5 MB weights are 8 parts of 8 MiB (`model.q8.gguf.part0`-`7`), because Pages refuses
+  any file over 25 MiB; `cat` them in order to get the original back (sha256 `a7d9aad2...`, the Hub's).
+  `lib/phonon-checkpoint.mjs` is the one place that knows the files, their sizes and how to load them:
+  the Phonon page, the main page's Phonon voice and the editor all go through it.
 - **Loaded when the page opens**, not when asked. The voice prefill and `Model.load` stay in the load;
   they are over before anyone has typed a sentence.
-- **A first download that resumes.** The page puts the checkpoint into the package's own cache
-  (`phonon-tts-v1`, which the package reads before the network) itself, in sequential 8 MB ranges kept
-  under their own keys, so a tab closed at 30 of 65 MB picks up at 30. Sequential because 8 parallel
-  ranges measured slower than one stream (1.72 against 2.03 MB/s): the line is the limit, not the
-  connection. A browser or server that refuses the range falls back to one stream. Then
-  `navigator.storage.persist()`, so Chrome does not evict 65 MB under disk pressure.
-- **This machine's disk before the network.** `server.mjs` serves the checkpoint same-origin from the
-  Hugging Face cache (`$HF_HOME/hub/models--gradium--phonon-31m-en/snapshots/<commit>/`) when every file
-  is there at its pinned size, and `/api/config` returns its path; anywhere else the page uses the Hub.
-  Here that turns a 35-97 s first load into a disk read.
+- **A first download that resumes.** The checkpoint goes into the package's own cache (`phonon-tts-v1`,
+  which the package reads before the network) part by part, each kept under its own URL until all are in,
+  so a tab closed at 30 of 65 MB picks up at 30. The parts download one at a time because 8 parallel
+  requests measured slower than one stream (1.72 against 2.03 MB/s): the line is the limit, not the
+  connection. Then the parts become one entry for the package, whatever that cache still holds from older
+  checkpoints or the Hub is dropped, and `navigator.storage.persist()` asks Chrome not to evict 65 MB
+  under disk pressure.
 - **Package files cached for a year.** The vendored package is in `lib/phonon-0.4.0/`, a directory named
   for its version, served `Cache-Control: public, max-age=31536000, immutable` by `server.mjs`,
   `lambda/handler.mjs` and `_headers`, so a load revalidates none of its module and wasm files. An update
@@ -411,10 +415,10 @@ Measured on the page on this laptop (headless Chrome, the box at ~600-800 MB of 
 |---|---|
 | warm, browser already open (3 reloads) | 0.88-1.89 s |
 | warm, fresh browser process (5 launches) | 1.17-25.74 s, all of it inside the package's own model load |
-| first load, copied from this disk | 6.78 s |
-| first load from the Hub | 40.8 s, 39.1 of them the download at 0.7-2.3 MB/s; a tab closed at 20.4 MB resumed at 17.3 |
+| first load from this machine's disk (before the model moved into the repo) | 6.78 s |
+| first load from the Hub (likewise) | 40.8 s, 39.1 of them the download at 0.7-2.3 MB/s; a tab closed at 20.4 MB resumed at 17.3 |
 
-The page logs where each load went: `[phonon] ready in N ms: source, hub download, model load`. The spread
+The page logs where each load went: `[phonon] ready in N ms: checkpoint, model load`. The spread
 in fresh processes is this machine swapping, not the page: the cache read is 13-66 ms in every run, and the
 same load measured 0.64 s phase by phase with more memory free. After that, speech starts 150-250 ms after
 pressing speak, most of it the model reading the sentence before its first frame.
@@ -428,13 +432,12 @@ France?": the first word of the answer came 0.77-1.04 s after the turn ended, wh
 you stop talking, 1.44 s of that being the pause that ends a turn. The main page's call with Paradee took
 1.30-1.67 s for the same.
 
-**On Cloudflare** the page deploys with the commands above (`phonon.html` is in the copy line). There is
-no local checkpoint there, so `/api/config` has no `phonon` path and the page uses the Hub: the first
-visit downloads 65 MB, resumably, into the Cache API, and later visits load from it. Whistle's 17.8 MB
-come from the Hub once too. Calls go through the existing `/api/chat` function with the `GROQ_API_KEY`
-secret. Pages itself cannot hold the checkpoint (25 MiB per file). An R2 bucket with CORS could, and
-`/api/config` returning its URL as `phonon` is all the page needs, but on a ~2 MB/s line it would not be
-faster than the Hub (1.92 against 1.59 MB/s measured).
+**On Cloudflare** the page deploys with the commands above (`models/` is in the copy line), and the
+checkpoint comes from Cloudflare's edge like every other file: the first visit downloads 65 MB,
+resumably, into the Cache API, and later visits load from it. Measured from here, Cloudflare's edge gave
+1.92 MB/s against the Hub's 1.59, and its first byte comes without the Hub's redirect to a second host.
+Whistle's 17.8 MB still come from the Hub, once. Calls go through the existing `/api/chat` function with
+the `GROQ_API_KEY` secret.
 
 Why the rest cannot go: a first download over a ~2 MB/s line is 65 MB / 2 MB/s whoever serves it, and
 the file cannot shrink much, because 44.44 MB of it (69%, all of Mimi and part of flow_lm) is BF16 that
